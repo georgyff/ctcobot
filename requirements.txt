@@ -1,0 +1,26 @@
+ipython>=8.10
+jupyterlab>=3.0
+notebook
+kedro[jupyter]~=1.2.0
+kedro-datasets[pandas-csvdataset, pandas-exceldataset, pandas-parquetdataset, plotly-plotlydataset, plotly-jsondataset, matplotlib-matplotlibdataset]>=3.0
+kedro-viz>=6.7.0
+scikit-learn~=1.5.1
+seaborn~=0.12.1
+
+# RAG core
+chromadb>=0.5.0
+tiktoken>=0.7.0
+
+# Document processing
+python-frontmatter>=1.1.0
+mistune>=3.0.2
+
+# CLI
+click>=8.1.7
+
+# Kedro datasets we'll need
+kedro-datasets[pandas-csvdataset, pandas-parquetdataset, json-jsondataset]>=3.0
+
+# Utilities
+python-dotenv>=1.0.0
+tenacity>=8.3.0

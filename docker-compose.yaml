@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  ctco_bot_service:
+    build: .
+    container_name: ctco_bot
+    network_mode: host
+    volumes:
+      - ./:/mnt:rw
+    environment:
+      - GRANT_SUDO=yes
+      - JUPYTER_ENABLE_LAB=yes
+      - PYTHONUNBUFFERED=1
+      - UV_SYSTEM_PYTHON=1
+      # - OLLAMA_HOST=http://ollama2_0:11434
+    # Run UV sync to install dependencies from pyproject.toml, then start JupyterLab
+    entrypoint: /bin/bash -c "uv sync && uv run jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token='' --ServerApp.password=''"
+    stdin_open: true
+    tty: true
+    user: root

@@ -1,0 +1,77 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# 01_raw — source corpus (read-only, never written by pipeline)
+# ══════════════════════════════════════════════════════════════════════════════
+raw_docs:
+  type: json.JSONDataset
+  filepath: data/01_raw/raw_docs.json
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 02_intermediate — cleaned documents
+# ══════════════════════════════════════════════════════════════════════════════
+cleaned_docs:
+  type: json.JSONDataset
+  filepath: data/02_intermediate/cleaned_docs.json
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 03_primary — chunked documents
+# ══════════════════════════════════════════════════════════════════════════════
+chunked_docs:
+  type: json.JSONDataset
+  filepath: data/03_primary/chunked_docs.json
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 04_feature — query intermediates
+# ══════════════════════════════════════════════════════════════════════════════
+
+query_embedding:
+  type: json.JSONDataset
+  filepath: data/04_feature/query_embedding.json
+
+retrieved_chunks:
+  type: json.JSONDataset
+  filepath: data/04_feature/retrieved_chunks.json
+
+prompt_data:
+  type: json.JSONDataset
+  filepath: data/04_feature/prompt_data.json
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 05_model_input — evaluation Q&A pairs
+# ══════════════════════════════════════════════════════════════════════════════
+eval_qa_pairs:
+  type: pandas.CSVDataset
+  filepath: data/05_model_input/eval_qa_pairs.csv
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 07_model_output — query results
+# ══════════════════════════════════════════════════════════════════════════════
+indexing_summary:
+  type: json.JSONDataset
+  filepath: data/07_model_output/indexing_summary.json
+
+query_results:
+  type: json.JSONDataset
+  filepath: data/07_model_output/query_results.json
+
+retrieval_results:
+  type: json.JSONDataset
+  filepath: data/07_model_output/retrieval_results.json
+
+quality_results:
+  type: json.JSONDataset
+  filepath: data/07_model_output/quality_results.json
+
+latency_results:
+  type: json.JSONDataset
+  filepath: data/07_model_output/latency_results.json
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 08_reporting — benchmark outputs
+# ══════════════════════════════════════════════════════════════════════════════
+benchmark_report:
+  type: json.JSONDataset
+  filepath: data/08_reporting/benchmark_report.json
+
+benchmark_report_csv:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/benchmark_report.csv

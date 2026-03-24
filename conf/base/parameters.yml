@@ -1,0 +1,39 @@
+# ── Runtime (overridden at query time via CLI) ─────────────────────────────────
+question: "What is the company PTO policy?"
+
+# ── Chunking ──────────────────────────────────────────────────────────────────
+chunk_size: 512          # tokens per chunk
+chunk_overlap: 50        # token overlap between consecutive chunks
+encoding_name: "cl100k_base"   # tiktoken encoding (matches gpt-4o-mini & embeddings)
+
+# ── Retrieval ─────────────────────────────────────────────────────────────────
+top_k: 5                 # number of chunks to retrieve per query
+
+# ── Models ────────────────────────────────────────────────────────────────────
+embedding_model: "nomic-embed-text"
+llm_model: "llama3.2"
+judge_model: "llama3.2"
+ollama_base_url: "http://localhost:11434"
+
+# ── ChromaDB ──────────────────────────────────────────────────────────────────
+chroma_collection_name: "ctcobot_handbook"
+chroma_persist_path: "data/04_feature/chroma_db"
+
+# ── Corpus ────────────────────────────────────────────────────────────────────
+raw_data_path: "data/01_raw/gitlab_handbook"
+min_doc_tokens: 50       # documents shorter than this are filtered out
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+eval_num_latency_runs: 20        # total query runs for latency measurement
+eval_latency_questions:          # fixed question set used for latency eval
+  - "What is the expense reimbursement policy?"
+  - "How do I report a security incident?"
+  - "What is the policy on outside employment?"
+  - "How many days of PTO are employees entitled to?"
+  - "What are the data retention requirements?"
+
+priority_folders:
+  - "legal"
+  - "people-group"
+  - "total-rewards"
+  - "people-policies"
