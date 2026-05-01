@@ -1,16 +1,58 @@
 """
-Indexing pipeline nodes — T-07: ingest_documents
+Indexing pipeline nodes — ingest documents and build PageIndex hierarchical trees.
 """
+import asyncio
 import logging
+import os
 from pathlib import Path
-import re
-import frontmatter
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-import tiktoken
-import ollama
-import chromadb
+
+import ollama as ollama_lib
+
+from pageindex import PageIndexClient
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_pageindex_for_ollama(ollama_base_url: str, pageindex_model: str) -> None:
+    """
+    Replace PageIndex's litellm-based LLM calls with direct Ollama SDK calls.
+
+    litellm cannot connect to local Ollama (times out regardless of OLLAMA_API_BASE).
+    The Ollama Python SDK works correctly. Both functions are patched at the module
+    level so all callers within pageindex see the replacement immediately.
+
+    generate_doc_description  → utils.llm_completion  (sync, one call per doc)
+    generate_node_summary     → utils.llm_acompletion (async, one call per long section)
+    """
+    import pageindex.utils as _utils
+
+    _client = ollama_lib.Client(host=ollama_base_url)
+
+    def _sync_llm(model, prompt, chat_history=None, return_finish_reason=False):
+        msgs = list(chat_history or []) + [{"role": "user", "content": prompt}]
+        try:
+            resp = _client.chat(model=pageindex_model, messages=msgs)
+            content = resp["message"]["content"]
+        except Exception as e:
+            logger.warning(f"Ollama call failed during indexing: {e}")
+            content = ""
+        return (content, "finished") if return_finish_reason else content
+
+    async def _async_llm(model, prompt):
+        loop = asyncio.get_running_loop()
+        msgs = [{"role": "user", "content": prompt}]
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                lambda: _client.chat(model=pageindex_model, messages=msgs),
+            )
+            return resp["message"]["content"]
+        except Exception as e:
+            logger.warning(f"Ollama async call failed during indexing: {e}")
+            return ""
+
+    _utils.llm_completion = _sync_llm
+    _utils.llm_acompletion = _async_llm
 
 
 def ingest_documents(raw_data_path: str) -> list[dict]:
@@ -41,10 +83,7 @@ def ingest_documents(raw_data_path: str) -> list[dict]:
                 skipped += 1
                 continue
 
-            # Relative path from corpus root (used as source identifier)
             relative_path = str(file_path.relative_to(root))
-
-            # Top-level folder (e.g. "legal", "people-group")
             parts = file_path.relative_to(root).parts
             folder = parts[0] if len(parts) > 1 else "__root__"
 
@@ -62,238 +101,101 @@ def ingest_documents(raw_data_path: str) -> list[dict]:
     logger.info(f"Ingested {len(documents)} documents. Skipped {skipped}.")
     return documents
 
-def clean_documents(
-    documents: list[dict],
-    min_doc_tokens: int,
-    encoding_name: str,
-) -> list[dict]:
-    """
-    Clean raw documents: strip YAML frontmatter, normalize whitespace,
-    and filter out documents that are too short to be useful.
 
-    Args:
-        documents:      Output of ingest_documents.
-        min_doc_tokens: Minimum token count to keep a document.
-        encoding_name:  tiktoken encoding name for token counting.
-
-    Returns:
-        List of cleaned document dicts with keys:
-        path, text, folder, filename, token_count.
-    """
-    import tiktoken
-    enc = tiktoken.get_encoding(encoding_name)
-
-    cleaned = []
-    filtered_short = 0
-    filtered_empty = 0
-
-    for doc in documents:
-        raw = doc["raw_text"]
-
-       # Pre-clean: remove degenerate lone --- lines before frontmatter parsing
-        # e.g. "---\n\n---\n\n## content" confuses python-frontmatter
-        pre = re.sub(r'^(---\s*\n\s*\n)+', '', raw.strip())
-
-        # Strip YAML frontmatter
-        pre = re.sub(r'^(---\s*\n\s*\n)+', '', raw.strip())
-        try:
-            parsed = frontmatter.loads(pre)
-            text = parsed.content.strip()
-        except Exception:
-            text = pre.strip()
-
-        # Remove Hugo shortcodes FIRST before sweeping orphaned ---
-        text = re.sub(r'\{\{[%<].*?[%>]\}\}', '', text, flags=re.DOTALL)
-
-        # Final sweep: strip any leftover lone --- lines at the top
-        lines = text.split('\n')
-        while lines and re.match(r'^---\s*$', lines[0]):
-            lines.pop(0)
-            while lines and not lines[0].strip():
-                lines.pop(0)
-        text = '\n'.join(lines).strip()
-
-        # Normalize excessive whitespace (3+ newlines → 2)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = text.strip()
-
-        # Normalize excessive whitespace (3+ newlines → 2)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = text.strip()
-
-        if not text:
-            filtered_empty += 1
-            continue
-
-        token_count = len(enc.encode(text))
-
-        if token_count < min_doc_tokens:
-            filtered_short += 1
-            continue
-
-        cleaned.append({
-            "path": doc["path"],
-            "text": text,
-            "folder": doc["folder"],
-            "filename": doc["filename"],
-            "token_count": token_count,
-        })
-
-    logger.info(
-        f"Cleaning complete. Kept: {len(cleaned)} | "
-        f"Filtered (too short): {filtered_short} | "
-        f"Filtered (empty): {filtered_empty}"
-    )
-    return cleaned
-
-def chunk_documents(
-    documents: list[dict],
-    chunk_size: int,
-    chunk_overlap: int,
-    encoding_name: str,
-) -> list[dict]:
-    """
-    Split cleaned documents into fixed-size token chunks with overlap
-    using LangChain's RecursiveCharacterTextSplitter with tiktoken backend.
-
-    Args:
-        documents:      Output of clean_documents.
-        chunk_size:     Maximum tokens per chunk.
-        chunk_overlap:  Number of tokens to overlap between chunks.
-        encoding_name:  tiktoken encoding name.
-
-    Returns:
-        List of chunk dicts with keys:
-        chunk_id, source_path, folder, filename, text, token_count,
-        chunk_index, total_chunks.
-    """
-
-    enc = tiktoken.get_encoding(encoding_name)
-
-    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        encoding_name=encoding_name,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-
-    chunks = []
-
-    for doc in documents:
-        split_texts = splitter.split_text(doc["text"])
-
-        if not split_texts:
-            continue
-
-        doc_chunks = []
-        for chunk_index, chunk_text in enumerate(split_texts):
-            token_count = len(enc.encode(chunk_text))
-            doc_chunks.append({
-                "chunk_id": f"{doc['path']}::chunk_{chunk_index}",
-                "source_path": doc["path"],
-                "folder": doc["folder"],
-                "filename": doc["filename"],
-                "text": chunk_text,
-                "token_count": token_count,
-                "chunk_index": chunk_index,
-                "total_chunks": len(split_texts),
-            })
-
-        chunks.extend(doc_chunks)
-
-    logger.info(
-        f"Chunking complete. {len(documents)} docs → {len(chunks)} chunks "
-        f"(chunk_size={chunk_size}, overlap={chunk_overlap})"
-    )
-    return chunks
-
-def embed_and_index(
-    chunks: list[dict],
+def pageindex_index_documents(
+    raw_docs: list[dict],
+    raw_data_path: str,
+    pageindex_model: str,
+    pageindex_workspace: str,
     ollama_base_url: str,
-    embedding_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
 ) -> dict:
     """
-    Embed all chunks using Ollama and upsert into ChromaDB.
+    Index all documents with PageIndex, building a hierarchical tree and generating
+    LLM summaries for each node and a one-sentence document description.
+
+    PageIndex's default LLM backend (litellm) cannot connect to local Ollama.
+    This function patches litellm's call sites to use the Ollama Python SDK instead,
+    then delegates to PageIndexClient.index() which runs:
+      - md_to_tree() with if_add_node_summary='yes': section summaries via LLM
+      - generate_doc_description(): one-sentence doc summary via LLM
+
+    Both are cached to the pageindex_workspace/ JSON files. At query time,
+    get_document_structure() returns the tree with summaries, giving the navigation
+    LLM the context it needs to pick relevant sections.
+
+    Supports incremental re-runs: files already in the workspace are skipped.
 
     Args:
-        chunks:                 Output of chunk_documents.
-        ollama_base_url:        Ollama server URL.
-        embedding_model:        Ollama embedding model name.
-        chroma_persist_path:    Path to persist ChromaDB.
-        chroma_collection_name: ChromaDB collection name.
+        raw_docs:            Output of ingest_documents.
+        raw_data_path:       Root path of the markdown corpus.
+        pageindex_model:     Ollama model for summaries and descriptions (qwen3.5:4b).
+        pageindex_workspace: Directory where PageIndex caches tree JSON files.
+        ollama_base_url:     Ollama server URL.
 
     Returns:
-        Dict with indexing summary stats.
+        doc_registry: dict mapping doc_id -> {source_path, folder, filename, description}
     """
+    _patch_pageindex_for_ollama(ollama_base_url, pageindex_model)
 
-    # Initialise ChromaDB persistent client
-    Path(chroma_persist_path).mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=chroma_persist_path)
-
-    # Get or create collection (cosine similarity)
-    collection = client.get_or_create_collection(
-        name=chroma_collection_name,
-        metadata={"hnsw:space": "cosine"},
+    client = PageIndexClient(
+        model=pageindex_model,
+        workspace=pageindex_workspace,
     )
 
-    ollama_client = ollama.Client(host=ollama_base_url)
-
-    BATCH_SIZE = 50
-    total = len(chunks)
-    indexed = 0
-    errors = 0
-
-    for batch_start in range(0, total, BATCH_SIZE):
-        batch = chunks[batch_start: batch_start + BATCH_SIZE]
-
-        ids = []
-        embeddings = []
-        documents = []
-        metadatas = []
-
-        for chunk in batch:
-            try:
-                response = ollama_client.embeddings(
-                    model=embedding_model,
-                    prompt=chunk["text"],
-                )
-                embedding = response["embedding"]
-
-                ids.append(chunk["chunk_id"])
-                embeddings.append(embedding)
-                documents.append(chunk["text"])
-                metadatas.append({
-                    "source_path": chunk["source_path"],
-                    "folder": chunk["folder"],
-                    "filename": chunk["filename"],
-                    "chunk_index": chunk["chunk_index"],
-                    "total_chunks": chunk["total_chunks"],
-                    "token_count": chunk["token_count"],
-                })
-                indexed += 1
-
-            except Exception as e:
-                logger.warning(f"Failed to embed chunk {chunk['chunk_id']}: {e}")
-                errors += 1
-
-        if ids:
-            collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas,
-            )
-
-        if batch_start % 500 == 0:
-            logger.info(f"Progress: {batch_start}/{total} chunks indexed...")
-
-    summary = {
-        "total_chunks": total,
-        "indexed": indexed,
-        "errors": errors,
-        "collection": chroma_collection_name,
-        "chroma_path": chroma_persist_path,
+    # Build reverse map of already-indexed absolute paths from the workspace
+    indexed_paths: dict[str, str] = {
+        doc["path"]: doc_id
+        for doc_id, doc in client.documents.items()
+        if doc.get("path")
     }
-    logger.info(f"Indexing complete: {summary}")
-    return summary
+
+    root = Path(raw_data_path)
+    doc_registry: dict = {}
+    total = len(raw_docs)
+    new_count = 0
+
+    logger.info(
+        f"PageIndex: indexing {total} documents with '{pageindex_model}' via Ollama..."
+    )
+
+    for i, doc_meta in enumerate(raw_docs):
+        file_path = root / doc_meta["path"]
+        abs_path = str(file_path.resolve())
+
+        # ── Incremental: skip already-indexed files ───────────────────────────
+        if abs_path in indexed_paths:
+            doc_id = indexed_paths[abs_path]
+            doc_registry[doc_id] = {
+                "source_path": doc_meta["path"],
+                "folder": doc_meta["folder"],
+                "filename": doc_meta["filename"],
+                "description": client.documents[doc_id].get("doc_description", ""),
+            }
+            continue
+
+        # ── Index: build tree + generate summaries + description via Ollama ───
+        try:
+            doc_id = client.index(abs_path)
+            description = client.documents[doc_id].get("doc_description", "")
+
+            doc_registry[doc_id] = {
+                "source_path": doc_meta["path"],
+                "folder": doc_meta["folder"],
+                "filename": doc_meta["filename"],
+                "description": description,
+            }
+            indexed_paths[abs_path] = doc_id
+            new_count += 1
+
+            if (i + 1) % 50 == 0 or (i + 1) == total:
+                logger.info(f"  Indexed {i + 1}/{total} ({new_count} new)")
+
+        except Exception as e:
+            logger.warning(f"Failed to index {doc_meta['path']}: {e}")
+
+    logger.info(
+        f"PageIndex indexing complete. "
+        f"Registry: {len(doc_registry)}/{total} docs "
+        f"({new_count} new, {len(doc_registry) - new_count} from cache)."
+    )
+    return doc_registry

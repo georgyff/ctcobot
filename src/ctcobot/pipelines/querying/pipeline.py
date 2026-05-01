@@ -1,30 +1,23 @@
 from kedro.pipeline import Pipeline, node, pipeline
 
-from .nodes import embed_query, retrieve_chunks, build_prompt, generate_answer
+from .nodes import build_prompt, generate_answer, pageindex_retrieve
 
 
 def create_pipeline(**kwargs) -> Pipeline:
     return pipeline([
         node(
-            func=embed_query,
+            func=pageindex_retrieve,
             inputs=[
                 "params:question",
+                "doc_registry",
+                "params:pageindex_model",
+                "params:pageindex_workspace",
                 "params:ollama_base_url",
-                "params:embedding_model",
-            ],
-            outputs="query_embedding",
-            name="embed_query_node",
-        ),
-        node(
-            func=retrieve_chunks,
-            inputs=[
-                "query_embedding",
-                "params:chroma_persist_path",
-                "params:chroma_collection_name",
-                "params:top_k",
+                "params:pageindex_top_docs",
+                "params:pageindex_top_sections",
             ],
             outputs="retrieved_chunks",
-            name="retrieve_chunks_node",
+            name="pageindex_retrieve_node",
         ),
         node(
             func=build_prompt,

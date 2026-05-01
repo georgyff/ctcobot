@@ -1,89 +1,73 @@
 """
 Evaluation pipeline nodes — retrieval, quality, latency, reporting.
 """
-import logging
-import time
-import ollama
-import chromadb
 import json
+import logging
 import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
 import ollama
-
-from ctcobot.pipelines.querying.nodes import (
-        embed_query, retrieve_chunks, build_prompt, generate_answer
-    )
-from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
-
-from ctcobot.pipelines.querying.nodes import (
-        embed_query, retrieve_chunks, build_prompt, generate_answer
-    )
-
-from datetime import datetime
-
 import pandas as pd
+
+from ctcobot.pipelines.querying.nodes import (
+    build_prompt,
+    generate_answer,
+    pageindex_retrieve,
+)
+from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
 
 logger = logging.getLogger(__name__)
 
 
 def run_retrieval_eval(
     eval_qa_pairs: pd.DataFrame,
+    doc_registry: dict,
     ollama_base_url: str,
-    embedding_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
-    top_k: int,
+    pageindex_model: str,
+    pageindex_workspace: str,
+    pageindex_top_docs: int,
+    pageindex_top_sections: int,
 ) -> dict:
     """
     Evaluate retrieval quality using hit rate and MRR.
 
-    For each Q&A pair, embed the question, retrieve top-k chunks,
-    and check whether the expected source file appears in results.
+    For each Q&A pair, run pageindex_retrieve and check whether the
+    expected source file appears in the retrieved results.
 
     Args:
         eval_qa_pairs:          DataFrame with columns: question,
                                 expected_answer, source_file, folder.
+        doc_registry:           PageIndex document registry.
         ollama_base_url:        Ollama server URL.
-        embedding_model:        Ollama embedding model name.
-        chroma_persist_path:    ChromaDB path.
-        chroma_collection_name: ChromaDB collection name.
-        top_k:                  Number of chunks to retrieve.
+        pageindex_model:        Ollama model used for PageIndex navigation.
+        pageindex_workspace:    PageIndex workspace directory.
+        pageindex_top_docs:     Documents selected in coarse retrieval stage.
+        pageindex_top_sections: Sections fetched per selected document.
 
     Returns:
         Dict with hit_rate, mrr, and per-question details.
     """
-
-    ollama_client = ollama.Client(host=ollama_base_url)
-    chroma_client = chromadb.PersistentClient(path=chroma_persist_path)
-    collection = chroma_client.get_collection(name=chroma_collection_name)
-
     results = []
     hits = 0
     reciprocal_ranks = []
 
     for _, row in eval_qa_pairs.iterrows():
         question = row["question"]
-        expected_source = row["source_file"]  # e.g. "people-group/anti-harassment.md"
+        expected_source = row["source_file"]
 
-        # Embed question
-        response = ollama_client.embeddings(
-            model=embedding_model,
-            prompt=question,
+        chunks = pageindex_retrieve(
+            question=question,
+            doc_registry=doc_registry,
+            pageindex_model=pageindex_model,
+            pageindex_workspace=pageindex_workspace,
+            ollama_base_url=ollama_base_url,
+            pageindex_top_docs=pageindex_top_docs,
+            pageindex_top_sections=pageindex_top_sections,
         )
-        embedding = response["embedding"]
+        retrieved_sources = [c["source_path"] for c in chunks]
 
-        # Retrieve top-k
-        query_results = collection.query(
-            query_embeddings=[embedding],
-            n_results=top_k,
-            include=["metadatas", "distances"],
-        )
-
-        retrieved_sources = [
-            m.get("source_path", "")
-            for m in query_results["metadatas"][0]
-        ]
-
-        # Check hit — expected source matches end of any retrieved source path
         hit = False
         rank = 0
         for i, src in enumerate(retrieved_sources, start=1):
@@ -120,40 +104,42 @@ def run_retrieval_eval(
         "mrr": round(mrr, 4),
         "hits": hits,
         "total": n,
-        "top_k": top_k,
+        "top_k": pageindex_top_docs,
         "details": results,
     }
-    
+
+
 def run_quality_eval(
     eval_qa_pairs: pd.DataFrame,
+    doc_registry: dict,
     ollama_base_url: str,
-    embedding_model: str,
+    pageindex_model: str,
+    pageindex_workspace: str,
     llm_model: str,
     judge_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
-    top_k: int,
+    pageindex_top_docs: int,
+    pageindex_top_sections: int,
 ) -> dict:
     """
     Evaluate answer quality using an LLM-as-judge approach.
 
-    For each Q&A pair, generate an answer with the full RAG pipeline,
-    then score it 1-5 using the judge model.
+    For each Q&A pair, generate an answer via the full PageIndex RAG
+    pipeline, then score it 1-5 using the judge model.
 
     Args:
         eval_qa_pairs:          DataFrame with eval questions.
+        doc_registry:           PageIndex document registry.
         ollama_base_url:        Ollama server URL.
-        embedding_model:        Embedding model name.
+        pageindex_model:        Ollama model for PageIndex navigation.
+        pageindex_workspace:    PageIndex workspace directory.
         llm_model:              Answer generation model.
         judge_model:            Model used to score answers.
-        chroma_persist_path:    ChromaDB path.
-        chroma_collection_name: ChromaDB collection name.
-        top_k:                  Chunks to retrieve per question.
+        pageindex_top_docs:     Documents selected in coarse stage.
+        pageindex_top_sections: Sections fetched per document.
 
     Returns:
         Dict with avg_score, score distribution, and per-question details.
     """
-
     ollama_client = ollama.Client(host=ollama_base_url)
     results = []
     scores = []
@@ -162,11 +148,15 @@ def run_quality_eval(
         question = row["question"]
         expected_answer = row["expected_answer"]
 
-        # Generate answer via full RAG pipeline
         try:
-            embedding = embed_query(question, ollama_base_url, embedding_model)
-            chunks = retrieve_chunks(
-                embedding, chroma_persist_path, chroma_collection_name, top_k
+            chunks = pageindex_retrieve(
+                question=question,
+                doc_registry=doc_registry,
+                pageindex_model=pageindex_model,
+                pageindex_workspace=pageindex_workspace,
+                ollama_base_url=ollama_base_url,
+                pageindex_top_docs=pageindex_top_docs,
+                pageindex_top_sections=pageindex_top_sections,
             )
             prompt_data = build_prompt(question, chunks)
             result = generate_answer(prompt_data, ollama_base_url, llm_model)
@@ -177,7 +167,6 @@ def run_quality_eval(
             actual_answer = "ERROR: could not generate answer"
             sources = []
 
-        # Judge the answer
         judge_user_prompt = format_judge_prompt(
             question=question,
             expected_answer=expected_answer,
@@ -193,10 +182,10 @@ def run_quality_eval(
                     {"role": "system", "content": JUDGE_PROMPT},
                     {"role": "user", "content": judge_user_prompt},
                 ],
+                think=False,
             )
             raw = judge_response["message"]["content"].strip()
 
-            # Extract JSON robustly — find first { ... } block
             match = re.search(r'\{.*?\}', raw, re.DOTALL)
             if match:
                 parsed = json.loads(match.group())
@@ -224,7 +213,6 @@ def run_quality_eval(
 
     valid_scores = [s for s in scores if s and s > 0]
     avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
-
     score_dist = {str(i): scores.count(i) for i in range(1, 6)}
 
     logger.info(
@@ -239,37 +227,36 @@ def run_quality_eval(
         "valid_scores": len(valid_scores),
         "details": results,
     }
-    
+
+
 def run_latency_eval(
+    doc_registry: dict,
     ollama_base_url: str,
-    embedding_model: str,
+    pageindex_model: str,
+    pageindex_workspace: str,
     llm_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
-    top_k: int,
     eval_latency_questions: list[str],
     eval_num_latency_runs: int,
+    pageindex_top_docs: int,
+    pageindex_top_sections: int,
 ) -> dict:
     """
-    Measure end-to-end query pipeline latency.
-
-    Runs the full pipeline eval_num_latency_runs times across the
-    provided question set and computes P50, P95, P99 latencies.
+    Measure end-to-end query pipeline latency with PageIndex retrieval.
 
     Args:
+        doc_registry:             PageIndex document registry.
         ollama_base_url:          Ollama server URL.
-        embedding_model:          Embedding model name.
-        llm_model:                LLM model name.
-        chroma_persist_path:      ChromaDB path.
-        chroma_collection_name:   ChromaDB collection name.
-        top_k:                    Chunks to retrieve.
+        pageindex_model:          Ollama model for PageIndex navigation.
+        pageindex_workspace:      PageIndex workspace directory.
+        llm_model:                LLM model name for answer generation.
         eval_latency_questions:   Fixed question set to cycle through.
         eval_num_latency_runs:    Total number of timed runs.
+        pageindex_top_docs:       Documents selected per query.
+        pageindex_top_sections:   Sections fetched per document.
 
     Returns:
         Dict with p50, p95, p99 latencies and per-run timings.
     """
-
     latencies = []
     errors = 0
     n_questions = len(eval_latency_questions)
@@ -284,25 +271,30 @@ def run_latency_eval(
         t_start = time.perf_counter()
 
         try:
-            embedding = embed_query(question, ollama_base_url, embedding_model)
-            chunks = retrieve_chunks(
-                embedding, chroma_persist_path, chroma_collection_name, top_k
+            chunks = pageindex_retrieve(
+                question=question,
+                doc_registry=doc_registry,
+                pageindex_model=pageindex_model,
+                pageindex_workspace=pageindex_workspace,
+                ollama_base_url=ollama_base_url,
+                pageindex_top_docs=pageindex_top_docs,
+                pageindex_top_sections=pageindex_top_sections,
             )
             prompt_data = build_prompt(question, chunks)
             generate_answer(prompt_data, ollama_base_url, llm_model)
 
             elapsed = time.perf_counter() - t_start
             latencies.append(elapsed)
-            logger.info(f"Run {i+1}/{eval_num_latency_runs}: {elapsed:.2f}s")
+            logger.info(f"Run {i + 1}/{eval_num_latency_runs}: {elapsed:.2f}s")
 
         except Exception as e:
-            logger.warning(f"Run {i+1} failed: {e}")
+            logger.warning(f"Run {i + 1} failed: {e}")
             errors += 1
 
     latencies.sort()
     n = len(latencies)
 
-    def percentile(data, p):
+    def percentile(data: list, p: int) -> float:
         if not data:
             return 0.0
         idx = max(0, int(len(data) * p / 100) - 1)
@@ -329,26 +321,48 @@ def run_latency_eval(
     )
     return result
 
+
 def save_benchmark_report(
     retrieval_results: dict,
     quality_results: dict,
     latency_results: dict,
+    llm_model: str,
+    judge_model: str,
+    pageindex_model: str,
+    pageindex_top_docs: int,
+    pageindex_top_sections: int,
+    eval_num_latency_runs: int,
+    parameters: dict,
 ) -> dict:
     """
     Aggregate all evaluation metrics into a single benchmark report.
 
     Args:
-        retrieval_results: Output of run_retrieval_eval.
-        quality_results:   Output of run_quality_eval.
-        latency_results:   Output of run_latency_eval.
+        retrieval_results:      Output of run_retrieval_eval.
+        quality_results:        Output of run_quality_eval.
+        latency_results:        Output of run_latency_eval.
+        llm_model:              LLM used to generate answers.
+        judge_model:            LLM used to score answer quality.
+        pageindex_model:        Ollama model used for PageIndex operations.
+        pageindex_top_docs:     Docs selected per query.
+        pageindex_top_sections: Sections fetched per document.
+        eval_num_latency_runs:  Number of timed runs for latency eval.
+        parameters:             Full parameters dict (for extras).
 
     Returns:
         Aggregated benchmark report dict.
     """
-
     report = {
-        "benchmark_version": "1.0",
-        "timestamp": datetime.utcnow().isoformat(),
+        "benchmark_version": "3.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "parameters": {
+            "pageindex_model": pageindex_model,
+            "llm_model": llm_model,
+            "judge_model": judge_model,
+            "pageindex_top_docs": pageindex_top_docs,
+            "pageindex_top_sections": pageindex_top_sections,
+            "eval_num_latency_runs": eval_num_latency_runs,
+        },
         "targets": {
             "hit_rate_at_5": 0.70,
             "mrr": 0.55,
@@ -389,10 +403,16 @@ def save_benchmark_report(
         },
     }
 
-    # Print summary table to stdout
+    raw_version = str(report.get("benchmark_version", "unknown"))
+    version_tag = "v" + raw_version.replace(".", "-")
+    report_path = Path("data/08_reporting") / f"benchmark_report_{version_tag}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2))
+    logger.info("Benchmark report saved to %s", report_path)
+
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v1.0")
+    print("  ctcobot BENCHMARK REPORT v3.0")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

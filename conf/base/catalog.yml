@@ -6,26 +6,11 @@ raw_docs:
   filepath: data/01_raw/raw_docs.json
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 02_intermediate — cleaned documents
+# 04_feature — PageIndex workspace registry + query intermediates
 # ══════════════════════════════════════════════════════════════════════════════
-cleaned_docs:
+doc_registry:
   type: json.JSONDataset
-  filepath: data/02_intermediate/cleaned_docs.json
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 03_primary — chunked documents
-# ══════════════════════════════════════════════════════════════════════════════
-chunked_docs:
-  type: json.JSONDataset
-  filepath: data/03_primary/chunked_docs.json
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 04_feature — query intermediates
-# ══════════════════════════════════════════════════════════════════════════════
-
-query_embedding:
-  type: json.JSONDataset
-  filepath: data/04_feature/query_embedding.json
+  filepath: data/04_feature/doc_registry.json
 
 retrieved_chunks:
   type: json.JSONDataset
