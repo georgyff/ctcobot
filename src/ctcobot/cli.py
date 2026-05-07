@@ -43,6 +43,7 @@ def ask(question: str):
         build_prompt,
         generate_answer,
         pageindex_retrieve,
+        rewrite_query,
     )
 
     registry_path = project_path / "data/04_feature/doc_registry.json"
@@ -58,14 +59,21 @@ def ask(question: str):
 
     click.echo(f"\n🔍 Searching handbook for: {question}\n")
 
+    expanded = rewrite_query(
+        question=question,
+        pageindex_model=params["pageindex_model"],
+        ollama_base_url=params["ollama_base_url"],
+    )
     chunks = pageindex_retrieve(
         question=question,
+        expanded_question=expanded,
         doc_registry=doc_registry,
         pageindex_model=params["pageindex_model"],
         pageindex_workspace=params["pageindex_workspace"],
         ollama_base_url=params["ollama_base_url"],
         pageindex_top_docs=params["pageindex_top_docs"],
         pageindex_top_sections=params["pageindex_top_sections"],
+        pageindex_reranker_top_k=params["pageindex_reranker_top_k"],
     )
 
     prompt_data = build_prompt(question=question, chunks=chunks)

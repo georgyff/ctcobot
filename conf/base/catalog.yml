@@ -38,6 +38,10 @@ query_results:
   type: json.JSONDataset
   filepath: data/07_model_output/query_results.json
 
+eval_rag_results:
+  type: json.JSONDataset
+  filepath: data/07_model_output/eval_rag_results.json
+
 retrieval_results:
   type: json.JSONDataset
   filepath: data/07_model_output/retrieval_results.json

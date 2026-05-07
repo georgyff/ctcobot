@@ -2,10 +2,10 @@
 Querying pipeline nodes — PageIndex retrieval, prompt assembly, answer generation.
 """
 import dataclasses
-import json
 import logging
 import os
 import re
+from collections import defaultdict
 
 import ollama as ollama_lib
 from pageindex import PageIndexClient  # noqa: E402
@@ -46,19 +46,38 @@ def _select_folders(
 ) -> set[str]:
     """Ask the LLM to pick relevant top-level folders when the registry is large."""
     folders = sorted({meta["folder"] for meta in doc_registry.values()})
+
+    # Collect up to 5 representative filenames per folder so the LLM can see
+    # what each folder actually contains rather than guessing from the bare name.
+    folder_samples: dict[str, list[str]] = {f: [] for f in folders}
+    for meta in doc_registry.values():
+        samples = folder_samples[meta["folder"]]
+        if len(samples) < 5:
+            samples.append(meta["filename"])
+
+    folder_lines = []
+    for i, folder in enumerate(folders):
+        samples = folder_samples[folder]
+        hint = ", ".join(samples) if samples else ""
+        folder_lines.append(f"{i + 1}. {folder} [{hint}]")
+
     prompt = (
         "You are a document selector. Given the question below, pick the "
-        "most relevant folders from this list.\n\n"
+        "most relevant folders from this list. Each folder shows sample file names.\n\n"
         f"Question: {question}\n\n"
-        "Folders:\n" +
-        "\n".join(f"{i + 1}. {f}" for i, f in enumerate(folders)) + "\n\n"
+        "Folders (with sample files):\n" +
+        "\n".join(folder_lines) + "\n\n"
         "Reply with a comma-separated list of folder numbers only (e.g. 1,3). "
         "No explanation."
     )
-    response = ollama_client.generate(model=pageindex_model, prompt=prompt, think=False)
+    response = ollama_client.generate(
+        model=pageindex_model, prompt=prompt, think=False,
+        options={"temperature": 0},
+    )
     indices = _parse_numbers(response.get("response", ""), len(folders))
     if not indices:
-        indices = list(range(min(3, len(folders))))
+        logger.warning("Folder selection parse failed — using all folders (no filter)")
+        return set(folders)
     return {folders[i] for i in indices}
 
 
@@ -102,13 +121,54 @@ def _coarse_select_docs(
         "Reply with a comma-separated list of document numbers only (e.g. 1,3,5). "
         "No explanation."
     )
-    response = ollama_client.generate(model=pageindex_model, prompt=prompt, think=False)
+    response = ollama_client.generate(
+        model=pageindex_model, prompt=prompt, think=False,
+        options={"temperature": 0},
+    )
     indices = _parse_numbers(response.get("response", ""), len(filtered_ids))
     indices = indices[:pageindex_top_docs]
     if not indices:
+        logger.warning("Doc selection parse failed — falling back to first %d docs", pageindex_top_docs)
         indices = list(range(min(pageindex_top_docs, len(filtered_ids))))
 
     return [filtered_ids[i] for i in indices]
+
+
+def _flatten_structure(nodes: list[dict], result: list[str] | None = None) -> list[str]:
+    """Build a flat list of 'node_id | title | preview' lines from a tree structure."""
+    if result is None:
+        result = []
+    for n in nodes:
+        preview = (n.get("text") or "").strip()[:1500].replace("\n", " ")
+        result.append(f"{n['node_id']} | {n.get('title', '')} | {preview}")
+        _flatten_structure(n.get("nodes", []), result)
+    return result
+
+
+def _collect_node_texts(nodes: list[dict], selected_ids: set[str]) -> list[str]:
+    """Return full text of all nodes whose node_id is in selected_ids."""
+    texts: list[str] = []
+    for n in nodes:
+        if n.get("node_id") in selected_ids:
+            t = (n.get("text") or "").strip()
+            if t:
+                texts.append(t)
+        texts.extend(_collect_node_texts(n.get("nodes", []), selected_ids))
+    return texts
+
+
+def _collect_node_details(
+    nodes: list[dict], selected_ids: set[str]
+) -> list[tuple[str, str, str]]:
+    """Return (node_id, title, text) for all nodes whose node_id is in selected_ids."""
+    results: list[tuple[str, str, str]] = []
+    for n in nodes:
+        if n.get("node_id") in selected_ids:
+            t = (n.get("text") or "").strip()
+            if t:
+                results.append((n["node_id"], n.get("title", ""), t))
+        results.extend(_collect_node_details(n.get("nodes", []), selected_ids))
+    return results
 
 
 def _retrieve_sections(
@@ -118,48 +178,66 @@ def _retrieve_sections(
     ctx: _RetrievalCtx,
 ) -> list[dict]:
     """
-    Stage 2: for each selected document, navigate the PageIndex tree and
-    fetch the relevant section text.
+    Stage 2: for each selected document, navigate the PageIndex tree using
+    text previews and select relevant sections by node_id.
+
+    Each node's first 1500 chars of text are shown to the navigation LLM so it
+    can make content-aware decisions rather than guessing from header titles alone.
+    The LLM selects node_ids (explicit IDs visible in the prompt) instead of
+    line ranges, avoiding ambiguous number parsing.
+
+    Each selected section is emitted as its own chunk so the answer LLM sees
+    clearly labelled, distinct excerpts rather than one large concatenated blob.
     """
     chunks: list[dict] = []
     for doc_id in selected_doc_ids:
         meta = doc_registry[doc_id]
         try:
-            structure = ctx.pageindex_client.get_document_structure(doc_id)
-            structure_str = (
-                json.dumps(structure, indent=2)
-                if isinstance(structure, dict)
-                else str(structure)
-            )
-            prompt = (
-                f"Given the document structure and the question, identify up to "
-                f"{ctx.top_sections} relevant section ranges to retrieve.\n\n"
-                f"Question: {question}\n\n"
-                f"Document structure:\n{structure_str}\n\n"
-                "Reply with page/line ranges as a single comma-separated string "
-                "(e.g. '5-7,12' or '3'). If no section is relevant, reply 'none'. "
-                "No explanation."
-            )
-            response = ctx.ollama_client.generate(model=ctx.model, prompt=prompt, think=False)
-            pages_str = response.get("response", "").strip()
+            # Trigger lazy-load: after this call doc['structure'] is in memory with full text
+            ctx.pageindex_client.get_document_structure(doc_id)
+            structure = ctx.pageindex_client.documents.get(doc_id, {}).get("structure", [])
+            if not structure:
+                logger.info(f"Empty structure for {meta['source_path']}")
+                continue
 
-            if not pages_str or pages_str.lower() == "none":
+            nav_lines = _flatten_structure(structure)
+            nav_str = "\n".join(nav_lines)
+
+            prompt = (
+                "Given the document sections and the question, identify the most relevant sections.\n"
+                "Include sections that answer directly OR via acronym expansion, synonyms, or indirect references.\n\n"
+                f"Question: {question}\n\n"
+                f"Sections (node_id | title | content preview):\n{nav_str}\n\n"
+                f"Reply with a comma-separated list of node_id values (e.g. '0001,0003'). "
+                f"Select up to {ctx.top_sections} most relevant sections. "
+                "If none are relevant, reply 'none'. No explanation."
+            )
+            response = ctx.ollama_client.generate(
+                model=ctx.model, prompt=prompt, think=False,
+                options={"temperature": 0},
+            )
+            node_ids_str = response.get("response", "").strip()
+
+            if not node_ids_str or node_ids_str.lower() == "none":
                 logger.info(f"No relevant sections found in {meta['source_path']}")
                 continue
 
-            content = ctx.pageindex_client.get_page_content(doc_id, pages=pages_str)
-            if not content:
+            selected_ids = {s.strip() for s in re.split(r"[,\s]+", node_ids_str) if s.strip()}
+            node_details = _collect_node_details(structure, selected_ids)
+            if not node_details:
+                logger.info(f"No content for node_ids {selected_ids} in {meta['source_path']}")
                 continue
 
-            chunks.append({
-                "text": content,
-                "source_path": meta["source_path"],
-                "folder": meta["folder"],
-                "filename": meta["filename"],
-                "chunk_index": 0,
-                "score": 1.0,
-            })
-            logger.info(f"Retrieved '{pages_str}' from {meta['source_path']}")
+            for idx, (node_id, title, text) in enumerate(node_details):
+                chunks.append({
+                    "text": text,
+                    "source_path": meta["source_path"],
+                    "folder": meta["folder"],
+                    "filename": meta["filename"],
+                    "chunk_index": idx,
+                    "score": 1.0,
+                })
+            logger.info(f"Retrieved {len(node_details)} section(s) from {meta['source_path']}")
 
         except Exception as e:
             logger.warning(f"Failed to retrieve from {meta['source_path']}: {e}")
@@ -167,39 +245,134 @@ def _retrieve_sections(
     return chunks
 
 
+def _rerank_chunks(
+    chunks: list[dict],
+    question: str,
+    ollama_client: ollama_lib.Client,
+    model: str,
+    top_k: int,
+) -> list[dict]:
+    """
+    Stage 3: rerank all retrieved chunks with a single listwise LLM call,
+    then return the top-k most relevant in ranked order.
+
+    Each chunk is shown as a 300-char preview so the reranker prompt stays
+    compact. Scores are set to 1/rank so downstream deduplication preserves
+    the relevance ordering.
+    """
+    if len(chunks) <= top_k:
+        return chunks
+
+    lines = []
+    for i, chunk in enumerate(chunks, start=1):
+        preview = chunk["text"].strip()[:600].replace("\n", " ")
+        lines.append(f"[{i}] {chunk['source_path']}\n{preview}")
+
+    prompt = (
+        "You are a relevance ranker. Given the question and the document excerpts below, "
+        "rank the excerpts from most to least relevant for answering the question.\n\n"
+        f"Question: {question}\n\n"
+        "Excerpts:\n" + "\n\n".join(lines) + "\n\n"
+        f"Reply with a comma-separated list of all {len(chunks)} excerpt numbers "
+        "in order of relevance (most relevant first), e.g. '3,1,7,2'. No explanation."
+    )
+    response = ollama_client.generate(
+        model=model, prompt=prompt, think=False,
+        options={"temperature": 0},
+    )
+    indices = _parse_numbers(response.get("response", ""), len(chunks))
+
+    # Append any indices the LLM omitted so we never silently drop chunks
+    seen = set(indices)
+    indices += [i for i in range(len(chunks)) if i not in seen]
+
+    reranked = []
+    for rank, i in enumerate(indices[:top_k], start=1):
+        chunk = dict(chunks[i])
+        chunk["score"] = round(1.0 / rank, 4)
+        reranked.append(chunk)
+
+    logger.info(
+        "Reranker: %d → %d chunks. Top sources: %s",
+        len(chunks), top_k,
+        [reranked[j]["source_path"].split("/")[-1] for j in range(min(3, len(reranked)))],
+    )
+    return reranked
+
+
+def rewrite_query(
+    question: str,
+    pageindex_model: str,
+    ollama_base_url: str,
+) -> str:
+    """
+    Expand and rewrite the question to improve retrieval recall.
+
+    Expands acronyms, disambiguates generic terms, and adds HR-domain context
+    so the coarse and section selectors pick the right documents.
+    Falls back to the original question if the LLM returns nothing usable.
+    """
+    client = ollama_lib.Client(host=ollama_base_url)
+    prompt = (
+        "You are a search query optimizer for an HR policy knowledge base. "
+        "Rewrite the following question to improve document retrieval by: "
+        "expanding any acronyms to their full form, adding relevant synonyms, "
+        "and making implicit HR topics explicit. "
+        "Keep the rewritten query concise (1–2 sentences) and natural. "
+        "Output only the rewritten query, nothing else.\n\n"
+        f"Question: {question}"
+    )
+    response = client.generate(
+        model=pageindex_model, prompt=prompt, think=False,
+        options={"temperature": 0},
+    )
+    rewritten = response.get("response", "").strip()
+    if not rewritten:
+        logger.warning("Query rewriting returned empty — using original question")
+        return question
+    logger.info("Query rewritten: '%s' → '%s'", question[:80], rewritten[:120])
+    return rewritten
+
+
 def pageindex_retrieve(
     question: str,
+    expanded_question: str,
     doc_registry: dict,
     pageindex_model: str,
     pageindex_workspace: str,
     ollama_base_url: str,
     pageindex_top_docs: int,
     pageindex_top_sections: int,
+    pageindex_reranker_top_k: int,
 ) -> list[dict]:
     """
     Retrieve relevant content from the PageIndex document registry using
-    two-stage LLM-driven navigation.
+    three-stage LLM-driven navigation.
 
     Stage 1 (coarse): one Ollama call selects the top-N most relevant
     documents from the registry listing.
 
     Stage 2 (fine): for each selected document, one Ollama call navigates
-    the PageIndex tree structure to identify relevant sections, then
-    get_page_content fetches the actual text.
+    the PageIndex tree structure to identify relevant sections.
+
+    Stage 3 (rerank): one Ollama call reranks all retrieved sections by
+    relevance, keeping the top-k most relevant chunks.
 
     Args:
-        question:              The user's question.
-        doc_registry:          Mapping of doc_id -> {source_path, folder,
-                               filename, description} from pageindex_index_documents.
-        pageindex_model:       Ollama model name used for tree navigation.
-        pageindex_workspace:   Directory where PageIndex cached tree structures.
-        ollama_base_url:       Ollama server URL.
-        pageindex_top_docs:    Max documents to select in stage 1.
-        pageindex_top_sections: Max section ranges to fetch per document in stage 2.
+        question:                  The user's question.
+        expanded_question:         Rewritten query used for all retrieval calls.
+        doc_registry:              Mapping of doc_id -> {source_path, folder,
+                                   filename, description}.
+        pageindex_model:           Ollama model name used for navigation.
+        pageindex_workspace:       Directory where PageIndex caches tree structures.
+        ollama_base_url:           Ollama server URL.
+        pageindex_top_docs:        Max documents to select in stage 1.
+        pageindex_top_sections:    Max section ranges to fetch per document in stage 2.
+        pageindex_reranker_top_k:  Max chunks to keep after stage 3 reranking.
 
     Returns:
         List of chunk dicts with keys: text, source_path, folder,
-        filename, chunk_index, score.
+        filename, chunk_index, score (1/rank after reranking).
     """
     if not doc_registry:
         logger.warning("Empty doc_registry — returning no chunks.")
@@ -216,16 +389,39 @@ def pageindex_retrieve(
     )
 
     selected_doc_ids = _coarse_select_docs(
-        doc_registry, question, ctx.ollama_client, pageindex_model, pageindex_top_docs
+        doc_registry, expanded_question, ctx.ollama_client, pageindex_model, pageindex_top_docs
     )
     logger.info(
-        f"Stage 1 selected {len(selected_doc_ids)} docs: "
-        f"{[doc_registry[d]['source_path'] for d in selected_doc_ids]}"
+        "Stage 1 selected %d docs: %s",
+        len(selected_doc_ids),
+        [doc_registry[d]["source_path"] for d in selected_doc_ids],
     )
 
-    chunks = _retrieve_sections(selected_doc_ids, doc_registry, question, ctx)
+    chunks = _retrieve_sections(selected_doc_ids, doc_registry, expanded_question, ctx)
 
-    logger.info(f"pageindex_retrieve: {len(chunks)} chunks for '{question[:60]}'")
+    if not chunks:
+        logger.warning(
+            "pageindex_retrieve: no chunks retrieved for '%s' — answer will have no context",
+            question[:60],
+        )
+        return chunks
+
+    # Stage 3: rerank with 3× candidates so the post-rank diversity filter has enough to work with
+    pre_div_k = min(len(chunks), pageindex_reranker_top_k * 3)
+    ranked = _rerank_chunks(chunks, expanded_question, ctx.ollama_client, pageindex_model, pre_div_k)
+
+    # Post-rerank diversity: keep top-2 per source while preserving relevance order
+    source_count: dict[str, int] = defaultdict(int)
+    final: list[dict] = []
+    for chunk in ranked:
+        if source_count[chunk["source_path"]] < 2:
+            final.append(chunk)
+            source_count[chunk["source_path"]] += 1
+        if len(final) >= pageindex_reranker_top_k:
+            break
+    chunks = final or ranked[:pageindex_reranker_top_k]
+
+    logger.info("pageindex_retrieve: %d chunks after reranking+diversity for '%s'", len(chunks), question[:60])
     return chunks
 
 

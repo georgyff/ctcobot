@@ -15,58 +15,118 @@ from ctcobot.pipelines.querying.nodes import (
     build_prompt,
     generate_answer,
     pageindex_retrieve,
+    rewrite_query,
 )
 from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
 
 logger = logging.getLogger(__name__)
 
 
-def run_retrieval_eval(
+def run_full_eval_rag(
     eval_qa_pairs: pd.DataFrame,
     doc_registry: dict,
     ollama_base_url: str,
     pageindex_model: str,
     pageindex_workspace: str,
+    llm_model: str,
     pageindex_top_docs: int,
     pageindex_top_sections: int,
-) -> dict:
+    pageindex_reranker_top_k: int,
+) -> list[dict]:
     """
-    Evaluate retrieval quality using hit rate and MRR.
-
-    For each Q&A pair, run pageindex_retrieve and check whether the
-    expected source file appears in the retrieved results.
+    Run the full RAG pipeline (rewrite → retrieve → answer) once for every
+    eval Q&A pair.  Downstream nodes consume these precomputed records instead
+    of repeating the expensive retrieval themselves.
 
     Args:
-        eval_qa_pairs:          DataFrame with columns: question,
-                                expected_answer, source_file, folder.
-        doc_registry:           PageIndex document registry.
-        ollama_base_url:        Ollama server URL.
-        pageindex_model:        Ollama model used for PageIndex navigation.
-        pageindex_workspace:    PageIndex workspace directory.
-        pageindex_top_docs:     Documents selected in coarse retrieval stage.
-        pageindex_top_sections: Sections fetched per selected document.
+        eval_qa_pairs:             DataFrame with columns: question,
+                                   expected_answer, source_file, folder.
+        doc_registry:              PageIndex document registry.
+        ollama_base_url:           Ollama server URL.
+        pageindex_model:           Ollama model used for PageIndex navigation.
+        pageindex_workspace:       PageIndex workspace directory.
+        llm_model:                 Answer generation model.
+        pageindex_top_docs:        Documents selected in coarse retrieval stage.
+        pageindex_top_sections:    Sections fetched per selected document.
+        pageindex_reranker_top_k:  Chunks kept after reranking.
+
+    Returns:
+        List of dicts with keys: question, expected_answer, source_file,
+        folder, expanded_question, chunks, answer, sources.
+    """
+    results = []
+
+    for _, row in eval_qa_pairs.iterrows():
+        question = row["question"]
+        expected_answer = row["expected_answer"]
+        source_file = row["source_file"]
+        folder = row.get("folder", "")
+
+        t_start = time.perf_counter()
+        try:
+            expanded = rewrite_query(question, pageindex_model, ollama_base_url)
+            chunks = pageindex_retrieve(
+                question=question,
+                expanded_question=expanded,
+                doc_registry=doc_registry,
+                pageindex_model=pageindex_model,
+                pageindex_workspace=pageindex_workspace,
+                ollama_base_url=ollama_base_url,
+                pageindex_top_docs=pageindex_top_docs,
+                pageindex_top_sections=pageindex_top_sections,
+                pageindex_reranker_top_k=pageindex_reranker_top_k,
+            )
+            prompt_data = build_prompt(question, chunks)
+            result = generate_answer(prompt_data, ollama_base_url, llm_model)
+            answer = result["answer"]
+            sources = result["sources"]
+            elapsed = time.perf_counter() - t_start
+        except Exception as e:
+            logger.warning("RAG failed for question: %s — %s", question[:50], e)
+            expanded = question
+            chunks = []
+            answer = "ERROR: could not generate answer"
+            sources = []
+            elapsed = time.perf_counter() - t_start
+
+        results.append({
+            "question": question,
+            "expected_answer": expected_answer,
+            "source_file": source_file,
+            "folder": folder,
+            "expanded_question": expanded,
+            "chunks": chunks,
+            "answer": answer,
+            "sources": sources,
+            "elapsed_seconds": round(elapsed, 3),
+        })
+        logger.info("RAG complete (%.2fs): %s", elapsed, question[:60])
+
+    return results
+
+
+def run_retrieval_eval(
+    eval_rag_results: list[dict],
+    pageindex_top_docs: int,
+) -> dict:
+    """
+    Compute hit rate and MRR from precomputed eval_rag_results.
+
+    Args:
+        eval_rag_results:  Output of run_full_eval_rag.
+        pageindex_top_docs: Top-K value recorded in the report.
 
     Returns:
         Dict with hit_rate, mrr, and per-question details.
     """
-    results = []
     hits = 0
     reciprocal_ranks = []
+    results = []
 
-    for _, row in eval_qa_pairs.iterrows():
-        question = row["question"]
-        expected_source = row["source_file"]
-
-        chunks = pageindex_retrieve(
-            question=question,
-            doc_registry=doc_registry,
-            pageindex_model=pageindex_model,
-            pageindex_workspace=pageindex_workspace,
-            ollama_base_url=ollama_base_url,
-            pageindex_top_docs=pageindex_top_docs,
-            pageindex_top_sections=pageindex_top_sections,
-        )
-        retrieved_sources = [c["source_path"] for c in chunks]
+    for record in eval_rag_results:
+        question = record["question"]
+        expected_source = record["source_file"]
+        retrieved_sources = [c["source_path"] for c in record["chunks"]]
 
         hit = False
         rank = 0
@@ -78,7 +138,6 @@ def run_retrieval_eval(
 
         hits += int(hit)
         reciprocal_ranks.append(1.0 / rank if rank > 0 else 0.0)
-
         results.append({
             "question": question,
             "expected_source": expected_source,
@@ -87,17 +146,18 @@ def run_retrieval_eval(
             "rank": rank,
             "reciprocal_rank": 1.0 / rank if rank > 0 else 0.0,
         })
-
         logger.info(
-            f"{'✅' if hit else '❌'} "
-            f"Rank={rank if hit else '-'} | {question[:60]}"
+            "%s Rank=%s | %s",
+            "✅" if hit else "❌",
+            rank if hit else "-",
+            question[:60],
         )
 
     n = len(results)
-    hit_rate = hits / n
-    mrr = sum(reciprocal_ranks) / n
+    hit_rate = hits / n if n > 0 else 0.0
+    mrr = sum(reciprocal_ranks) / n if n > 0 else 0.0
 
-    logger.info(f"Retrieval eval complete. Hit Rate: {hit_rate:.3f} | MRR: {mrr:.3f}")
+    logger.info("Retrieval eval complete. Hit Rate: %.3f | MRR: %.3f", hit_rate, mrr)
 
     return {
         "hit_rate": round(hit_rate, 4),
@@ -110,62 +170,30 @@ def run_retrieval_eval(
 
 
 def run_quality_eval(
-    eval_qa_pairs: pd.DataFrame,
-    doc_registry: dict,
+    eval_rag_results: list[dict],
     ollama_base_url: str,
-    pageindex_model: str,
-    pageindex_workspace: str,
-    llm_model: str,
     judge_model: str,
-    pageindex_top_docs: int,
-    pageindex_top_sections: int,
 ) -> dict:
     """
-    Evaluate answer quality using an LLM-as-judge approach.
-
-    For each Q&A pair, generate an answer via the full PageIndex RAG
-    pipeline, then score it 1-5 using the judge model.
+    Score answers using LLM-as-judge from precomputed eval_rag_results.
 
     Args:
-        eval_qa_pairs:          DataFrame with eval questions.
-        doc_registry:           PageIndex document registry.
-        ollama_base_url:        Ollama server URL.
-        pageindex_model:        Ollama model for PageIndex navigation.
-        pageindex_workspace:    PageIndex workspace directory.
-        llm_model:              Answer generation model.
-        judge_model:            Model used to score answers.
-        pageindex_top_docs:     Documents selected in coarse stage.
-        pageindex_top_sections: Sections fetched per document.
+        eval_rag_results: Output of run_full_eval_rag.
+        ollama_base_url:  Ollama server URL.
+        judge_model:      Model used to score answers.
 
     Returns:
         Dict with avg_score, score distribution, and per-question details.
     """
     ollama_client = ollama.Client(host=ollama_base_url)
-    results = []
     scores = []
+    results = []
 
-    for _, row in eval_qa_pairs.iterrows():
-        question = row["question"]
-        expected_answer = row["expected_answer"]
-
-        try:
-            chunks = pageindex_retrieve(
-                question=question,
-                doc_registry=doc_registry,
-                pageindex_model=pageindex_model,
-                pageindex_workspace=pageindex_workspace,
-                ollama_base_url=ollama_base_url,
-                pageindex_top_docs=pageindex_top_docs,
-                pageindex_top_sections=pageindex_top_sections,
-            )
-            prompt_data = build_prompt(question, chunks)
-            result = generate_answer(prompt_data, ollama_base_url, llm_model)
-            actual_answer = result["answer"]
-            sources = result["sources"]
-        except Exception as e:
-            logger.warning(f"RAG failed for question: {question[:50]} — {e}")
-            actual_answer = "ERROR: could not generate answer"
-            sources = []
+    for record in eval_rag_results:
+        question = record["question"]
+        expected_answer = record["expected_answer"]
+        actual_answer = record["answer"]
+        sources = record["sources"]
 
         judge_user_prompt = format_judge_prompt(
             question=question,
@@ -192,11 +220,11 @@ def run_quality_eval(
                 score = int(parsed["score"])
                 reason = parsed.get("reason", "")
             else:
-                logger.warning(f"Could not parse judge response: {raw[:100]}")
+                logger.warning("Could not parse judge response: %s", raw[:100])
                 score = 0
 
         except Exception as e:
-            logger.warning(f"Judge failed for question: {question[:50]} — {e}")
+            logger.warning("Judge failed for question: %s — %s", question[:50], e)
             score = 0
 
         scores.append(score)
@@ -208,16 +236,15 @@ def run_quality_eval(
             "score": score,
             "reason": reason,
         })
-
-        logger.info(f"Score={score}/5 | {question[:60]}")
+        logger.info("Score=%s/5 | %s", score, question[:60])
 
     valid_scores = [s for s in scores if s and s > 0]
     avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
     score_dist = {str(i): scores.count(i) for i in range(1, 6)}
 
     logger.info(
-        f"Quality eval complete. "
-        f"Avg score: {avg_score:.2f}/5 | Distribution: {score_dist}"
+        "Quality eval complete. Avg score: %.2f/5 | Distribution: %s",
+        avg_score, score_dist,
     )
 
     return {
@@ -229,69 +256,18 @@ def run_quality_eval(
     }
 
 
-def run_latency_eval(
-    doc_registry: dict,
-    ollama_base_url: str,
-    pageindex_model: str,
-    pageindex_workspace: str,
-    llm_model: str,
-    eval_latency_questions: list[str],
-    eval_num_latency_runs: int,
-    pageindex_top_docs: int,
-    pageindex_top_sections: int,
-) -> dict:
+def run_latency_eval(eval_rag_results: list[dict]) -> dict:
     """
-    Measure end-to-end query pipeline latency with PageIndex retrieval.
+    Compute latency statistics from timings recorded in run_full_eval_rag.
 
     Args:
-        doc_registry:             PageIndex document registry.
-        ollama_base_url:          Ollama server URL.
-        pageindex_model:          Ollama model for PageIndex navigation.
-        pageindex_workspace:      PageIndex workspace directory.
-        llm_model:                LLM model name for answer generation.
-        eval_latency_questions:   Fixed question set to cycle through.
-        eval_num_latency_runs:    Total number of timed runs.
-        pageindex_top_docs:       Documents selected per query.
-        pageindex_top_sections:   Sections fetched per document.
+        eval_rag_results: Output of run_full_eval_rag, each record contains
+                          elapsed_seconds measured over the full RAG pipeline.
 
     Returns:
         Dict with p50, p95, p99 latencies and per-run timings.
     """
-    latencies = []
-    errors = 0
-    n_questions = len(eval_latency_questions)
-
-    logger.info(
-        f"Starting latency eval: {eval_num_latency_runs} runs "
-        f"across {n_questions} questions..."
-    )
-
-    for i in range(eval_num_latency_runs):
-        question = eval_latency_questions[i % n_questions]
-        t_start = time.perf_counter()
-
-        try:
-            chunks = pageindex_retrieve(
-                question=question,
-                doc_registry=doc_registry,
-                pageindex_model=pageindex_model,
-                pageindex_workspace=pageindex_workspace,
-                ollama_base_url=ollama_base_url,
-                pageindex_top_docs=pageindex_top_docs,
-                pageindex_top_sections=pageindex_top_sections,
-            )
-            prompt_data = build_prompt(question, chunks)
-            generate_answer(prompt_data, ollama_base_url, llm_model)
-
-            elapsed = time.perf_counter() - t_start
-            latencies.append(elapsed)
-            logger.info(f"Run {i + 1}/{eval_num_latency_runs}: {elapsed:.2f}s")
-
-        except Exception as e:
-            logger.warning(f"Run {i + 1} failed: {e}")
-            errors += 1
-
-    latencies.sort()
+    latencies = sorted(r["elapsed_seconds"] for r in eval_rag_results)
     n = len(latencies)
 
     def percentile(data: list, p: int) -> float:
@@ -301,9 +277,9 @@ def run_latency_eval(
         return round(data[idx], 3)
 
     result = {
-        "total_runs": eval_num_latency_runs,
+        "total_runs": n,
         "successful_runs": n,
-        "errors": errors,
+        "errors": 0,
         "p50_seconds": percentile(latencies, 50),
         "p95_seconds": percentile(latencies, 95),
         "p99_seconds": percentile(latencies, 99),
@@ -314,10 +290,8 @@ def run_latency_eval(
     }
 
     logger.info(
-        f"Latency eval complete. "
-        f"P50={result['p50_seconds']}s | "
-        f"P95={result['p95_seconds']}s | "
-        f"P99={result['p99_seconds']}s"
+        "Latency eval complete. P50=%.3fs | P95=%.3fs | P99=%.3fs",
+        result["p50_seconds"], result["p95_seconds"], result["p99_seconds"],
     )
     return result
 
@@ -353,7 +327,7 @@ def save_benchmark_report(
         Aggregated benchmark report dict.
     """
     report = {
-        "benchmark_version": "3.0",
+        "benchmark_version": "2.7",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "parameters": {
             "pageindex_model": pageindex_model,

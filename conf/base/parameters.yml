@@ -10,7 +10,8 @@ ollama_base_url: "http://localhost:11434"
 pageindex_model: "qwen3.5:4b"                              # Ollama model for tree indexing + retrieval
 pageindex_workspace: "data/04_feature/pageindex_workspace" # cached tree structures on disk
 pageindex_top_docs: 8              # docs selected in coarse retrieval stage
-pageindex_top_sections: 5          # sections fetched per selected document
+pageindex_top_sections: 8          # sections fetched per selected document
+pageindex_reranker_top_k: 10       # chunks kept after stage-3 reranking
 
 # ── Corpus ────────────────────────────────────────────────────────────────────
 raw_data_path: "data/01_raw/gitlab_handbook"
