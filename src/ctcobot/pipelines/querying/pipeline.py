@@ -1,14 +1,31 @@
 from kedro.pipeline import Pipeline, node, pipeline
 
-from .nodes import embed_query, retrieve_chunks, build_prompt, generate_answer
+from .nodes import (
+    rewrite_query,
+    embed_query,
+    retrieve_chunks,
+    rerank_chunks,
+    build_prompt,
+    generate_answer,
+)
 
 
 def create_pipeline(**kwargs) -> Pipeline:
     return pipeline([
         node(
-            func=embed_query,
+            func=rewrite_query,
             inputs=[
                 "params:question",
+                "params:ollama_base_url",
+                "params:llm_model",
+            ],
+            outputs="rewritten_query",
+            name="rewrite_query_node",
+        ),
+        node(
+            func=embed_query,
+            inputs=[
+                "rewritten_query",
                 "params:ollama_base_url",
                 "params:embedding_model",
             ],
@@ -27,10 +44,22 @@ def create_pipeline(**kwargs) -> Pipeline:
             name="retrieve_chunks_node",
         ),
         node(
+            func=rerank_chunks,
+            inputs=[
+                "retrieved_chunks",
+                "params:question",
+                "params:reranker_model",
+                "params:rerank_top_n",
+                "params:ollama_base_url",
+            ],
+            outputs="reranked_chunks",
+            name="rerank_chunks_node",
+        ),
+        node(
             func=build_prompt,
             inputs=[
                 "params:question",
-                "retrieved_chunks",
+                "reranked_chunks",
             ],
             outputs="prompt_data",
             name="build_prompt_node",
