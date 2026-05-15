@@ -56,6 +56,19 @@ def run_retrieval_eval(
     chroma_client = chromadb.PersistentClient(path=chroma_persist_path)
     collection = chroma_client.get_collection(name=chroma_collection_name)
 
+    source_chunk_counts: dict[str, int] = {}
+    batch_size = 500
+    offset = 0
+    while True:
+        batch = collection.get(include=["metadatas"], limit=batch_size, offset=offset)
+        metas = batch.get("metadatas") or []
+        for meta in metas:
+            src = meta.get("source_path", "")
+            source_chunk_counts[src] = source_chunk_counts.get(src, 0) + 1
+        if len(metas) < batch_size:
+            break
+        offset += batch_size
+
     results = []
     hits = 0
     reciprocal_ranks = []
@@ -86,6 +99,17 @@ def run_retrieval_eval(
                 rank = i
                 break
 
+        retrieved_relevant = sum(
+            1 for src in retrieved_sources
+            if src.endswith(expected_source) or expected_source in src
+        )
+        total_relevant = sum(
+            count for src, count in source_chunk_counts.items()
+            if src.endswith(expected_source) or expected_source in src
+        )
+        precision = retrieved_relevant / top_k if top_k > 0 else 0.0
+        recall = retrieved_relevant / total_relevant if total_relevant > 0 else 0.0
+
         hits += int(hit)
         reciprocal_ranks.append(1.0 / rank if rank > 0 else 0.0)
         results.append({
@@ -95,6 +119,8 @@ def run_retrieval_eval(
             "hit": hit,
             "rank": rank,
             "reciprocal_rank": 1.0 / rank if rank > 0 else 0.0,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
         })
         logger.info(
             "%s Rank=%s | %s",
@@ -106,12 +132,19 @@ def run_retrieval_eval(
     n = len(results)
     hit_rate = hits / n if n > 0 else 0.0
     mrr = sum(reciprocal_ranks) / n if n > 0 else 0.0
+    avg_precision = sum(r["precision"] for r in results) / n if n > 0 else 0.0
+    avg_recall = sum(r["recall"] for r in results) / n if n > 0 else 0.0
 
-    logger.info("Retrieval eval complete. Hit Rate: %.3f | MRR: %.3f", hit_rate, mrr)
+    logger.info(
+        "Retrieval eval complete. Hit Rate: %.3f | MRR: %.3f | P: %.3f | R: %.3f",
+        hit_rate, mrr, avg_precision, avg_recall,
+    )
 
     return {
         "hit_rate": round(hit_rate, 4),
         "mrr": round(mrr, 4),
+        "avg_precision": round(avg_precision, 4),
+        "avg_recall": round(avg_recall, 4),
         "hits": hits,
         "total": n,
         "top_k": top_k,
@@ -340,11 +373,13 @@ def save_benchmark_report(
         Aggregated benchmark report dict.
     """
     report = {
-        "benchmark_version": "1.15",
+        "benchmark_version": "1.16",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
             "mrr": 0.55,
+            "precision_at_k": 0.15,
+            "recall_at_k": 0.35,
             "avg_quality_score": 3.5,
             "p95_latency_seconds": 5.0,
         },
@@ -352,11 +387,15 @@ def save_benchmark_report(
             "retrieval": {
                 "hit_rate_at_5": retrieval_results["hit_rate"],
                 "mrr": retrieval_results["mrr"],
+                "avg_precision": retrieval_results["avg_precision"],
+                "avg_recall": retrieval_results["avg_recall"],
                 "hits": retrieval_results["hits"],
                 "total": retrieval_results["total"],
                 "top_k": retrieval_results["top_k"],
                 "hit_rate_pass": retrieval_results["hit_rate"] >= 0.70,
                 "mrr_pass": retrieval_results["mrr"] >= 0.55,
+                "precision_pass": retrieval_results["avg_precision"] >= 0.15,
+                "recall_pass": retrieval_results["avg_recall"] >= 0.35,
             },
             "quality": {
                 "avg_score": quality_results["avg_score"],
@@ -382,18 +421,18 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v1-15.json")
+    report_path = Path("data/08_reporting/benchmark_report_v1-16.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v1.13")
+    print("  ctcobot BENCHMARK REPORT v1.16")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")
     print(
-        f"  {'Hit Rate @ 5':<30} "
+        f"  {'Hit Rate @ k':<30} "
         f"{r['retrieval']['hit_rate_at_5']:>8.3f}  "
         f"{'≥ 0.700':>8}  "
         f"{'✅' if r['retrieval']['hit_rate_pass'] else '❌':>6}"
@@ -403,6 +442,18 @@ def save_benchmark_report(
         f"{r['retrieval']['mrr']:>8.3f}  "
         f"{'≥ 0.550':>8}  "
         f"{'✅' if r['retrieval']['mrr_pass'] else '❌':>6}"
+    )
+    print(
+        f"  {'Precision @ k':<30} "
+        f"{r['retrieval']['avg_precision']:>8.3f}  "
+        f"{'≥ 0.150':>8}  "
+        f"{'✅' if r['retrieval']['precision_pass'] else '❌':>6}"
+    )
+    print(
+        f"  {'Recall @ k':<30} "
+        f"{r['retrieval']['avg_recall']:>8.3f}  "
+        f"{'≥ 0.350':>8}  "
+        f"{'✅' if r['retrieval']['recall_pass'] else '❌':>6}"
     )
     print(
         f"  {'Avg Quality Score (1-5)':<30} "

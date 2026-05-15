@@ -10,8 +10,8 @@ encoding_name: "cl100k_base"   # tiktoken encoding (matches gpt-4o-mini & embedd
 top_k: 10                 # number of chunks to retrieve before reranking
 
 # ── Reranker ──────────────────────────────────────────────────────────────────
-reranker_model: "qwen3.5:4b"   # upgraded from 0.8b for better relevance judgment
-rerank_top_n: 5          # chunks kept after reranking
+reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within documents
+rerank_top_n: 7          # chunks kept after reranking
 
 # ── Models ────────────────────────────────────────────────────────────────────
 embedding_model: "nomic-embed-text"
