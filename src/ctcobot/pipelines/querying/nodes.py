@@ -1,5 +1,5 @@
 """
-Querying pipeline nodes — rewrite, embed, retrieve, rerank, prompt, generate.
+Querying pipeline nodes — hyde, embed, retrieve, rerank, prompt, generate.
 """
 import logging
 
@@ -13,6 +13,43 @@ REWRITE_SYSTEM_PROMPT = (
     "but never let synonym expansion shift the core topic. "
     "Output only the rewritten query, nothing else."
 )
+
+
+def generate_hyde_doc(
+    question: str,
+    ollama_base_url: str,
+    llm_model: str,
+) -> str:
+    """
+    Generate a hypothetical document for HyDE retrieval.
+
+    Instead of embedding the query, embeds a plausible policy paragraph that
+    would answer the question. The paragraph is in the same semantic space as
+    actual handbook chunks, improving cosine-similarity retrieval.
+
+    Args:
+        question:        The original user question.
+        ollama_base_url: Ollama server URL.
+        llm_model:       Model used to generate the hypothetical document.
+
+    Returns:
+        A short policy paragraph (3-5 sentences) as a plain string.
+    """
+    import ollama
+    from ctcobot.prompt_templates import HYDE_SYSTEM_PROMPT
+
+    client = ollama.Client(host=ollama_base_url)
+    response = client.chat(
+        model=llm_model,
+        messages=[
+            {"role": "system", "content": HYDE_SYSTEM_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        think=False,
+    )
+    hyde_doc = response["message"]["content"].strip()
+    logger.info("HyDE doc generated for: %s", question[:60])
+    return hyde_doc
 
 
 def rewrite_query(

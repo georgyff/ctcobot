@@ -1,7 +1,7 @@
 from kedro.pipeline import Pipeline, node, pipeline
 
 from .nodes import (
-    rewrite_query,
+    generate_hyde_doc,
     embed_query,
     retrieve_chunks,
     rerank_chunks,
@@ -13,19 +13,19 @@ from .nodes import (
 def create_pipeline(**kwargs) -> Pipeline:
     return pipeline([
         node(
-            func=rewrite_query,
+            func=generate_hyde_doc,
             inputs=[
                 "params:question",
                 "params:ollama_base_url",
                 "params:llm_model",
             ],
-            outputs="rewritten_query",
-            name="rewrite_query_node",
+            outputs="hyde_document",
+            name="generate_hyde_doc_node",
         ),
         node(
             func=embed_query,
             inputs=[
-                "rewritten_query",
+                "hyde_document",
                 "params:ollama_base_url",
                 "params:embedding_model",
             ],

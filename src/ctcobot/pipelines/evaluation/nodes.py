@@ -13,7 +13,7 @@ import chromadb
 import pandas as pd
 
 from ctcobot.pipelines.querying.nodes import (
-    rewrite_query,
+    generate_hyde_doc,
     embed_query,
     retrieve_chunks,
     rerank_chunks,
@@ -77,7 +77,7 @@ def run_retrieval_eval(
         question = row["question"]
         expected_source = row["source_file"]
 
-        expanded = rewrite_query(question, ollama_base_url, llm_model)
+        expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
         embedding = embed_query(expanded, ollama_base_url, embedding_model)
 
         query_results = collection.query(
@@ -194,7 +194,7 @@ def run_quality_eval(
         expected_answer = row["expected_answer"]
 
         try:
-            expanded = rewrite_query(question, ollama_base_url, llm_model)
+            expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
             embedding = embed_query(expanded, ollama_base_url, embedding_model)
             chunks = retrieve_chunks(embedding, chroma_persist_path, chroma_collection_name, top_k)
             chunks = rerank_chunks(chunks, question, reranker_model, rerank_top_n, ollama_base_url)
@@ -312,7 +312,7 @@ def run_latency_eval(
         t_start = time.perf_counter()
 
         try:
-            expanded = rewrite_query(question, ollama_base_url, llm_model)
+            expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
             embedding = embed_query(expanded, ollama_base_url, embedding_model)
             chunks = retrieve_chunks(embedding, chroma_persist_path, chroma_collection_name, top_k)
             chunks = rerank_chunks(chunks, question, reranker_model, rerank_top_n, ollama_base_url)
@@ -373,7 +373,7 @@ def save_benchmark_report(
         Aggregated benchmark report dict.
     """
     report = {
-        "benchmark_version": "1.16",
+        "benchmark_version": "1.17",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -421,13 +421,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v1-16.json")
+    report_path = Path("data/08_reporting/benchmark_report_v1-17.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v1.16")
+    print("  ctcobot BENCHMARK REPORT v1.17")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

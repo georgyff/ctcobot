@@ -54,6 +54,15 @@ def format_rag_prompt(question: str, context: str) -> str:
     )
 
 
+HYDE_SYSTEM_PROMPT = (
+    "You are a company handbook author. Given an employee question about HR or company "
+    "policy, write a concise paragraph (3-5 sentences) in the style of a formal policy "
+    "document that directly answers the question. "
+    "Do not mention the question — write only the policy text. "
+    "Output ONLY the paragraph, nothing else."
+)
+
+
 JUDGE_PROMPT = """You are an expert evaluator assessing the quality of an AI assistant's answer to an HR policy question.
 
 You will be given:

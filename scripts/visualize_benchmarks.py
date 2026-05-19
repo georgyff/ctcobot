@@ -106,6 +106,20 @@ def main() -> None:
             result.append(float(node))
         return result
 
+    def extract_optional(reports, *keys) -> tuple[list[str], list[float]]:
+        """Like extract but skips reports where the key path is missing."""
+        vers, vals = [], []
+        for r in reports:
+            node = r
+            try:
+                for k in keys:
+                    node = node[k]
+                vers.append(r.get("benchmark_version", "?"))
+                vals.append(float(node))
+            except (KeyError, TypeError):
+                pass
+        return vers, vals
+
     plot_metric(
         versions,
         extract(reports, "results", "retrieval", "hit_rate_at_5"),
@@ -178,6 +192,30 @@ def main() -> None:
         output_name="latency_avg",
         target=None,
         higher_is_better=False,
+    )
+
+    prec_vers, prec_vals = extract_optional(reports, "results", "retrieval", "avg_precision")
+    plot_metric(
+        prec_vers,
+        prec_vals,
+        title="Precision @ k",
+        ylabel="Precision",
+        output_name="precision_at_k",
+        target=0.15,
+        target_label="Target ≥",
+        higher_is_better=True,
+    )
+
+    rec_vers, rec_vals = extract_optional(reports, "results", "retrieval", "avg_recall")
+    plot_metric(
+        rec_vers,
+        rec_vals,
+        title="Recall @ k",
+        ylabel="Recall",
+        output_name="recall_at_k",
+        target=0.35,
+        target_label="Target ≥",
+        higher_is_better=True,
     )
 
 
