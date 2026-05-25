@@ -84,6 +84,66 @@ def rewrite_query(
     return expanded
 
 
+SUB_QUERY_SYSTEM_PROMPT = (
+    "You are a search query decomposition assistant for an HR policy retrieval system. "
+    "Given a user question, generate exactly {n} specific sub-questions that together cover "
+    "different aspects or phrasings of the original question. "
+    "Each sub-question should be phrased as a standalone question a user might ask. "
+    "Output ONLY a JSON array of strings, nothing else.\n"
+    'Example: ["How does X work?", "What are the requirements for X?"]'
+)
+
+
+def generate_sub_queries(
+    question: str,
+    ollama_base_url: str,
+    llm_model: str,
+    num_sub_queries: int,
+) -> list[str]:
+    """
+    Decompose a question into focused sub-questions for multi-query retrieval.
+
+    Each sub-question covers a different aspect or phrasing, so that when
+    embedded independently they pull different chunks from the same source
+    document — improving recall without changing the index.
+
+    Args:
+        question:        The original user question.
+        ollama_base_url: Ollama server URL.
+        llm_model:       Model used to generate sub-questions.
+        num_sub_queries: How many sub-questions to generate.
+
+    Returns:
+        List of sub-question strings (may be shorter than requested on parse failure).
+    """
+    import json
+    import re
+    import ollama
+
+    client = ollama.Client(host=ollama_base_url)
+    response = client.chat(
+        model=llm_model,
+        messages=[
+            {"role": "system", "content": SUB_QUERY_SYSTEM_PROMPT.format(n=num_sub_queries)},
+            {"role": "user", "content": question},
+        ],
+        think=False,
+    )
+    raw = response["message"]["content"].strip()
+    match = re.search(r'\[.*?\]', raw, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, list):
+                sub_qs = [str(q) for q in parsed[:num_sub_queries]]
+                logger.info("Generated %d sub-queries for: %s", len(sub_qs), question[:60])
+                return sub_qs
+        except json.JSONDecodeError:
+            pass
+    logger.warning("Sub-query parse failed, falling back to no sub-queries")
+    return []
+
+
 def embed_query(
     question: str,
     ollama_base_url: str,
@@ -155,6 +215,78 @@ def retrieve_chunks(
         })
 
     logger.info("Retrieved %d chunks. Top score: %s", len(chunks), chunks[0]["score"] if chunks else "n/a")
+    return chunks
+
+
+def retrieve_chunks_multi(
+    query_embedding: list[float],
+    sub_queries: list[str],
+    ollama_base_url: str,
+    embedding_model: str,
+    chroma_persist_path: str,
+    chroma_collection_name: str,
+    top_k: int,
+) -> list[dict]:
+    """
+    Retrieve chunks using the HyDE embedding plus one embedding per sub-query.
+
+    Each query hits ChromaDB independently for top_k results. Results are merged
+    and deduplicated by (source_path, chunk_index), keeping the highest score per
+    chunk. This grows the candidate pool from top_k to roughly
+    (1 + len(sub_queries)) * top_k unique chunks, improving recall without
+    changing the index.
+
+    Args:
+        query_embedding:        Embedded HyDE document vector.
+        sub_queries:            Sub-questions to also retrieve for (may be empty).
+        ollama_base_url:        Ollama server URL.
+        embedding_model:        Ollama embedding model name.
+        chroma_persist_path:    Path to ChromaDB persistent store.
+        chroma_collection_name: ChromaDB collection name.
+        top_k:                  Number of chunks to retrieve per query.
+
+    Returns:
+        Deduplicated list of chunk dicts sorted by score descending.
+    """
+    import chromadb
+    import ollama as _ollama
+
+    chroma_client = chromadb.PersistentClient(path=chroma_persist_path)
+    collection = chroma_client.get_collection(name=chroma_collection_name)
+    oc = _ollama.Client(host=ollama_base_url)
+
+    all_embeddings = [query_embedding]
+    for sub_q in sub_queries:
+        resp = oc.embeddings(model=embedding_model, prompt=sub_q)
+        all_embeddings.append(resp["embedding"])
+
+    seen: dict[tuple, dict] = {}
+    for emb in all_embeddings:
+        results = collection.query(
+            query_embeddings=[emb],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"],
+        )
+        for text, meta, dist in zip(
+            results["documents"][0], results["metadatas"][0], results["distances"][0]
+        ):
+            key = (meta.get("source_path", ""), meta.get("chunk_index", 0))
+            score = round(1 - dist, 4)
+            if key not in seen or score > seen[key]["score"]:
+                seen[key] = {
+                    "text": text,
+                    "source_path": meta.get("source_path", "unknown"),
+                    "folder": meta.get("folder", "unknown"),
+                    "filename": meta.get("filename", "unknown"),
+                    "chunk_index": meta.get("chunk_index", 0),
+                    "score": score,
+                }
+
+    chunks = sorted(seen.values(), key=lambda c: c["score"], reverse=True)
+    logger.info(
+        "Multi-query retrieved %d unique chunks from %d queries.",
+        len(chunks), len(all_embeddings),
+    )
     return chunks
 
 

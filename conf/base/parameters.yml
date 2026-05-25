@@ -7,7 +7,7 @@ chunk_overlap: 50        # token overlap between consecutive chunks
 encoding_name: "cl100k_base"   # tiktoken encoding (matches gpt-4o-mini & embeddings)
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
-top_k: 10                 # number of chunks to retrieve before reranking
+top_k: 20                 # number of chunks to retrieve before reranking
 
 # ── Reranker ──────────────────────────────────────────────────────────────────
 reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within documents

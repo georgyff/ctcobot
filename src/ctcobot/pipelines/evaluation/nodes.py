@@ -25,7 +25,7 @@ from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
 logger = logging.getLogger(__name__)
 
 
-def run_retrieval_eval(
+def run_eval_pipeline(
     eval_qa_pairs: pd.DataFrame,
     ollama_base_url: str,
     embedding_model: str,
@@ -33,25 +33,64 @@ def run_retrieval_eval(
     chroma_persist_path: str,
     chroma_collection_name: str,
     top_k: int,
+    reranker_model: str,
+    rerank_top_n: int,
+) -> list[dict]:
+    """
+    Run the full RAG pipeline once per QA pair.
+
+    Captures pre-rerank chunk sources (for retrieval metrics) and generated
+    answers (for quality metrics) in a single pass, avoiding duplicate LLM calls.
+    """
+    results = []
+
+    for _, row in eval_qa_pairs.iterrows():
+        question = row["question"]
+        logger.info("Running pipeline for: %s", question[:60])
+
+        try:
+            expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
+            embedding = embed_query(expanded, ollama_base_url, embedding_model)
+            pre_rerank_chunks = retrieve_chunks(
+                embedding, chroma_persist_path, chroma_collection_name, top_k,
+            )
+            pre_rerank_sources = [c["source_path"] for c in pre_rerank_chunks]
+            reranked = rerank_chunks(pre_rerank_chunks, question, reranker_model, rerank_top_n, ollama_base_url)
+            prompt_data = build_prompt(question, reranked)
+            answer_result = generate_answer(prompt_data, ollama_base_url, llm_model)
+            results.append({
+                "question": question,
+                "expected_source": row["source_file"],
+                "expected_answer": row["expected_answer"],
+                "pre_rerank_sources": pre_rerank_sources,
+                "answer": answer_result["answer"],
+                "sources": answer_result["sources"],
+                "error": None,
+            })
+        except Exception as e:
+            logger.warning("Pipeline failed for: %s — %s", question[:50], e)
+            results.append({
+                "question": question,
+                "expected_source": row["source_file"],
+                "expected_answer": row["expected_answer"],
+                "pre_rerank_sources": [],
+                "answer": "ERROR",
+                "sources": [],
+                "error": str(e),
+            })
+
+    logger.info("Eval pipeline complete: %d questions processed.", len(results))
+    return results
+
+
+def compute_retrieval_metrics(
+    qa_eval_results: list[dict],
+    chroma_persist_path: str,
+    chroma_collection_name: str,
+    top_k: int,
 ) -> dict:
     """
-    Evaluate retrieval quality using hit rate and MRR.
-
-    Rewrites each question before embedding, retrieves top-k chunks,
-    and checks whether the expected source file appears in results.
-
-    Args:
-        eval_qa_pairs:          DataFrame with columns: question,
-                                expected_answer, source_file, folder.
-        ollama_base_url:        Ollama server URL.
-        embedding_model:        Ollama embedding model name.
-        llm_model:              Model used for query rewriting.
-        chroma_persist_path:    ChromaDB path.
-        chroma_collection_name: ChromaDB collection name.
-        top_k:                  Number of chunks to retrieve.
-
-    Returns:
-        Dict with hit_rate, mrr, and per-question details.
+    Compute retrieval metrics (hit rate, MRR, precision, recall) from pre-rerank chunk data.
     """
     chroma_client = chromadb.PersistentClient(path=chroma_persist_path)
     collection = chroma_client.get_collection(name=chroma_collection_name)
@@ -73,23 +112,9 @@ def run_retrieval_eval(
     hits = 0
     reciprocal_ranks = []
 
-    for _, row in eval_qa_pairs.iterrows():
-        question = row["question"]
-        expected_source = row["source_file"]
-
-        expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
-        embedding = embed_query(expanded, ollama_base_url, embedding_model)
-
-        query_results = collection.query(
-            query_embeddings=[embedding],
-            n_results=top_k,
-            include=["metadatas", "distances"],
-        )
-
-        retrieved_sources = [
-            m.get("source_path", "")
-            for m in query_results["metadatas"][0]
-        ]
+    for item in qa_eval_results:
+        expected_source = item["expected_source"]
+        retrieved_sources = item["pre_rerank_sources"]
 
         hit = False
         rank = 0
@@ -107,13 +132,14 @@ def run_retrieval_eval(
             count for src, count in source_chunk_counts.items()
             if src.endswith(expected_source) or expected_source in src
         )
-        precision = retrieved_relevant / top_k if top_k > 0 else 0.0
+        n_retrieved = len(retrieved_sources)
+        precision = retrieved_relevant / n_retrieved if n_retrieved > 0 else 0.0
         recall = retrieved_relevant / total_relevant if total_relevant > 0 else 0.0
 
         hits += int(hit)
         reciprocal_ranks.append(1.0 / rank if rank > 0 else 0.0)
         results.append({
-            "question": question,
+            "question": item["question"],
             "expected_source": expected_source,
             "retrieved_sources": retrieved_sources,
             "hit": hit,
@@ -126,7 +152,7 @@ def run_retrieval_eval(
             "%s Rank=%s | %s",
             "✅" if hit else "❌",
             rank if hit else "-",
-            question[:60],
+            item["question"][:60],
         )
 
     n = len(results)
@@ -136,7 +162,7 @@ def run_retrieval_eval(
     avg_recall = sum(r["recall"] for r in results) / n if n > 0 else 0.0
 
     logger.info(
-        "Retrieval eval complete. Hit Rate: %.3f | MRR: %.3f | P: %.3f | R: %.3f",
+        "Retrieval metrics: Hit Rate=%.3f | MRR=%.3f | P=%.3f | R=%.3f",
         hit_rate, mrr, avg_precision, avg_recall,
     )
 
@@ -152,60 +178,34 @@ def run_retrieval_eval(
     }
 
 
-def run_quality_eval(
-    eval_qa_pairs: pd.DataFrame,
+def compute_quality_metrics(
+    qa_eval_results: list[dict],
     ollama_base_url: str,
-    embedding_model: str,
-    llm_model: str,
     judge_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
-    top_k: int,
-    reranker_model: str,
-    rerank_top_n: int,
 ) -> dict:
     """
-    Evaluate answer quality using an LLM-as-judge approach.
-
-    Runs the full pipeline (rewrite → embed → retrieve → rerank → answer)
-    for each Q&A pair, then scores each answer 1-5 with the judge model.
-
-    Args:
-        eval_qa_pairs:          DataFrame with eval questions.
-        ollama_base_url:        Ollama server URL.
-        embedding_model:        Embedding model name.
-        llm_model:              Answer generation model.
-        judge_model:            Model used to score answers.
-        chroma_persist_path:    ChromaDB path.
-        chroma_collection_name: ChromaDB collection name.
-        top_k:                  Chunks to retrieve per question.
-        reranker_model:         HuggingFace cross-encoder model name.
-        rerank_top_n:           Chunks kept after reranking.
-
-    Returns:
-        Dict with avg_score, score distribution, and per-question details.
+    Score answer quality using an LLM judge on pre-generated answers.
     """
     ollama_client = ollama.Client(host=ollama_base_url)
     results = []
     scores = []
 
-    for _, row in eval_qa_pairs.iterrows():
-        question = row["question"]
-        expected_answer = row["expected_answer"]
+    for item in qa_eval_results:
+        question = item["question"]
+        expected_answer = item["expected_answer"]
+        actual_answer = item["answer"]
 
-        try:
-            expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
-            embedding = embed_query(expanded, ollama_base_url, embedding_model)
-            chunks = retrieve_chunks(embedding, chroma_persist_path, chroma_collection_name, top_k)
-            chunks = rerank_chunks(chunks, question, reranker_model, rerank_top_n, ollama_base_url)
-            prompt_data = build_prompt(question, chunks)
-            result = generate_answer(prompt_data, ollama_base_url, llm_model)
-            actual_answer = result["answer"]
-            sources = result["sources"]
-        except Exception as e:
-            logger.warning("RAG failed for question: %s — %s", question[:50], e)
-            actual_answer = "ERROR: could not generate answer"
-            sources = []
+        if item["error"]:
+            scores.append(0)
+            results.append({
+                "question": question,
+                "expected_answer": expected_answer,
+                "actual_answer": actual_answer,
+                "sources": [],
+                "score": 0,
+                "reason": f"pipeline error: {item['error']}",
+            })
+            continue
 
         judge_user_prompt = format_judge_prompt(
             question=question,
@@ -244,7 +244,7 @@ def run_quality_eval(
             "question": question,
             "expected_answer": expected_answer,
             "actual_answer": actual_answer,
-            "sources": [s["source_path"] for s in sources],
+            "sources": [s["source_path"] for s in item["sources"]],
             "score": score,
             "reason": reason,
         })
@@ -255,7 +255,7 @@ def run_quality_eval(
     score_dist = {str(i): scores.count(i) for i in range(1, 6)}
 
     logger.info(
-        "Quality eval complete. Avg score: %.2f/5 | Distribution: %s",
+        "Quality metrics: Avg=%.2f/5 | Distribution=%s",
         avg_score, score_dist,
     )
 
@@ -314,7 +314,9 @@ def run_latency_eval(
         try:
             expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
             embedding = embed_query(expanded, ollama_base_url, embedding_model)
-            chunks = retrieve_chunks(embedding, chroma_persist_path, chroma_collection_name, top_k)
+            chunks = retrieve_chunks(
+                embedding, chroma_persist_path, chroma_collection_name, top_k,
+            )
             chunks = rerank_chunks(chunks, question, reranker_model, rerank_top_n, ollama_base_url)
             prompt_data = build_prompt(question, chunks)
             generate_answer(prompt_data, ollama_base_url, llm_model)
@@ -373,7 +375,7 @@ def save_benchmark_report(
         Aggregated benchmark report dict.
     """
     report = {
-        "benchmark_version": "1.17",
+        "benchmark_version": "1.18",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -421,13 +423,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v1-17.json")
+    report_path = Path("data/08_reporting/benchmark_report_v1-18.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v1.17")
+    print("  ctcobot BENCHMARK REPORT v1.18")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

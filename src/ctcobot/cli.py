@@ -46,13 +46,20 @@ def ask(question: str, top_k: int):
 
     # Run querying nodes directly (faster than kedro run for interactive use)
     from ctcobot.pipelines.querying.nodes import (
-        embed_query, retrieve_chunks, build_prompt, generate_answer
+        generate_hyde_doc,
+        embed_query, retrieve_chunks, build_prompt, generate_answer,
     )
 
     click.echo(f"\n🔍 Searching handbook for: {question}\n")
 
-    embedding = embed_query(
+    hyde_doc = generate_hyde_doc(
         question=question,
+        ollama_base_url=params["ollama_base_url"],
+        llm_model=params["llm_model"],
+    )
+
+    embedding = embed_query(
+        question=hyde_doc,
         ollama_base_url=params["ollama_base_url"],
         embedding_model=params["embedding_model"],
     )
