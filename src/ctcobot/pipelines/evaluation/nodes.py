@@ -12,14 +12,8 @@ import ollama
 import chromadb
 import pandas as pd
 
-from ctcobot.pipelines.querying.nodes import (
-    generate_hyde_doc,
-    embed_query,
-    retrieve_chunks,
-    rerank_chunks,
-    build_prompt,
-    generate_answer,
-)
+from ctcobot.pipelines.querying.agent import QueryAgent
+from ctcobot.pipelines.querying.tools import GraphRAGTool, KeywordRAGTool, VectorRAGTool
 from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
 
 logger = logging.getLogger(__name__)
@@ -35,40 +29,67 @@ def run_eval_pipeline(
     top_k: int,
     reranker_model: str,
     rerank_top_n: int,
+    lightrag_working_dir: str,
+    agent_model: str,
 ) -> list[dict]:
     """
-    Run the full RAG pipeline once per QA pair.
+    Run the full agentic RAG pipeline once per QA pair (v3.0).
 
-    Captures pre-rerank chunk sources (for retrieval metrics) and generated
-    answers (for quality metrics) in a single pass, avoiding duplicate LLM calls.
+    Initialises the QueryAgent once with all three tools, then calls agent.run()
+    per question. Captures pre-rerank sources from VectorRAGTool (for retrieval
+    metrics), generated answers (for quality metrics), and tools_used per question.
     """
+    vector_tool = VectorRAGTool(
+        ollama_base_url=ollama_base_url,
+        embedding_model=embedding_model,
+        llm_model=llm_model,
+        chroma_persist_path=chroma_persist_path,
+        chroma_collection_name=chroma_collection_name,
+        top_k=top_k,
+        reranker_model=reranker_model,
+        rerank_top_n=rerank_top_n,
+    )
+    tools = {
+        "vector_rag": vector_tool,
+        "graph_rag": GraphRAGTool(
+            lightrag_working_dir=lightrag_working_dir,
+            ollama_base_url=ollama_base_url,
+            llm_model=llm_model,
+            embedding_model=embedding_model,
+        ),
+        "keyword_rag": KeywordRAGTool(
+            chroma_persist_path=chroma_persist_path,
+            chroma_collection_name=chroma_collection_name,
+            top_k=top_k,
+        ),
+    }
+    agent = QueryAgent(
+        tools=tools,
+        ollama_base_url=ollama_base_url,
+        agent_model=agent_model,
+        llm_model=llm_model,
+    )
+
     results = []
 
     for _, row in eval_qa_pairs.iterrows():
         question = row["question"]
-        logger.info("Running pipeline for: %s", question[:60])
+        logger.info("Running agent for: %s", question[:60])
 
         try:
-            expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
-            embedding = embed_query(expanded, ollama_base_url, embedding_model)
-            pre_rerank_chunks = retrieve_chunks(
-                embedding, chroma_persist_path, chroma_collection_name, top_k,
-            )
-            pre_rerank_sources = [c["source_path"] for c in pre_rerank_chunks]
-            reranked = rerank_chunks(pre_rerank_chunks, question, reranker_model, rerank_top_n, ollama_base_url)
-            prompt_data = build_prompt(question, reranked)
-            answer_result = generate_answer(prompt_data, ollama_base_url, llm_model)
+            agent_result = agent.run(question)
             results.append({
                 "question": question,
                 "expected_source": row["source_file"],
                 "expected_answer": row["expected_answer"],
-                "pre_rerank_sources": pre_rerank_sources,
-                "answer": answer_result["answer"],
-                "sources": answer_result["sources"],
+                "pre_rerank_sources": agent_result.get("pre_rerank_sources", []),
+                "answer": agent_result["answer"],
+                "sources": agent_result["sources"],
+                "tools_used": agent_result.get("tools_used", []),
                 "error": None,
             })
         except Exception as e:
-            logger.warning("Pipeline failed for: %s — %s", question[:50], e)
+            logger.warning("Agent failed for: %s — %s", question[:50], e)
             results.append({
                 "question": question,
                 "expected_source": row["source_file"],
@@ -76,6 +97,7 @@ def run_eval_pipeline(
                 "pre_rerank_sources": [],
                 "answer": "ERROR",
                 "sources": [],
+                "tools_used": [],
                 "error": str(e),
             })
 
@@ -245,6 +267,7 @@ def compute_quality_metrics(
             "expected_answer": expected_answer,
             "actual_answer": actual_answer,
             "sources": [s["source_path"] for s in item["sources"]],
+            "tools_used": item.get("tools_used", []),
             "score": score,
             "reason": reason,
         })
@@ -279,25 +302,48 @@ def run_latency_eval(
     rerank_top_n: int,
     eval_latency_questions: list[str],
     eval_num_latency_runs: int,
+    lightrag_working_dir: str,
+    agent_model: str,
 ) -> dict:
     """
-    Measure end-to-end query pipeline latency including rewrite and rerank.
+    Measure end-to-end agentic query pipeline latency (v3.0).
 
-    Args:
-        ollama_base_url:          Ollama server URL.
-        embedding_model:          Embedding model name.
-        llm_model:                LLM model name (also used for rewriting).
-        chroma_persist_path:      ChromaDB path.
-        chroma_collection_name:   ChromaDB collection name.
-        top_k:                    Chunks to retrieve.
-        reranker_model:           HuggingFace cross-encoder model name.
-        rerank_top_n:             Chunks kept after reranking.
-        eval_latency_questions:   Fixed question set to cycle through.
-        eval_num_latency_runs:    Total number of timed runs.
+    Initialises QueryAgent once, then times agent.run() per question so latency
+    includes tool-selection, retrieval, and answer synthesis.
 
     Returns:
         Dict with p50, p95, p99 latencies and per-run timings.
     """
+    tools = {
+        "vector_rag": VectorRAGTool(
+            ollama_base_url=ollama_base_url,
+            embedding_model=embedding_model,
+            llm_model=llm_model,
+            chroma_persist_path=chroma_persist_path,
+            chroma_collection_name=chroma_collection_name,
+            top_k=top_k,
+            reranker_model=reranker_model,
+            rerank_top_n=rerank_top_n,
+        ),
+        "graph_rag": GraphRAGTool(
+            lightrag_working_dir=lightrag_working_dir,
+            ollama_base_url=ollama_base_url,
+            llm_model=llm_model,
+            embedding_model=embedding_model,
+        ),
+        "keyword_rag": KeywordRAGTool(
+            chroma_persist_path=chroma_persist_path,
+            chroma_collection_name=chroma_collection_name,
+            top_k=top_k,
+        ),
+    }
+    agent = QueryAgent(
+        tools=tools,
+        ollama_base_url=ollama_base_url,
+        agent_model=agent_model,
+        llm_model=llm_model,
+    )
+
     latencies = []
     errors = 0
     n_questions = len(eval_latency_questions)
@@ -312,15 +358,7 @@ def run_latency_eval(
         t_start = time.perf_counter()
 
         try:
-            expanded = generate_hyde_doc(question, ollama_base_url, llm_model)
-            embedding = embed_query(expanded, ollama_base_url, embedding_model)
-            chunks = retrieve_chunks(
-                embedding, chroma_persist_path, chroma_collection_name, top_k,
-            )
-            chunks = rerank_chunks(chunks, question, reranker_model, rerank_top_n, ollama_base_url)
-            prompt_data = build_prompt(question, chunks)
-            generate_answer(prompt_data, ollama_base_url, llm_model)
-
+            agent.run(question)
             elapsed = time.perf_counter() - t_start
             latencies.append(elapsed)
             logger.info("Run %d/%d: %.2fs", i + 1, eval_num_latency_runs, elapsed)
@@ -374,8 +412,15 @@ def save_benchmark_report(
     Returns:
         Aggregated benchmark report dict.
     """
+    # Compute tools_used distribution from quality details (stored in qa_eval_results via
+    # run_eval_pipeline, but quality_results only has answers — derive from details)
+    all_tools: list[str] = []
+    for item in quality_results.get("details", []):
+        all_tools.extend(item.get("tools_used", []))
+    tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
+
     report = {
-        "benchmark_version": "1.18",
+        "benchmark_version": "3.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -416,6 +461,7 @@ def save_benchmark_report(
                 "latency_pass": latency_results["p95_seconds"] <= 5.0,
             },
         },
+        "tools_used_distribution": tools_used_distribution,
         "details": {
             "retrieval": retrieval_results.get("details", []),
             "quality": quality_results.get("details", []),
@@ -423,13 +469,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v1-18.json")
+    report_path = Path("data/08_reporting/benchmark_report_v3-0.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v1.18")
+    print("  ctcobot BENCHMARK REPORT v3.0")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

@@ -41,3 +41,14 @@ priority_folders:
   - "people-group"
   - "total-rewards"
   - "people-policies"
+
+# ── Agent (v3.0) ──────────────────────────────────────────────────────────────
+agent_model: "qwen3.5:4b"       # model used for tool-calling routing decisions
+lightrag_working_dir: "data/04_feature/lightrag_db"
+bm25_top_k: 10                  # keyword chunks returned by KeywordRAGTool
+lightrag_index_folders:         # only these handbook folders are graph-indexed
+  - people-policies
+  - people-group
+  - hiring
+  - total-rewards
+  - legal

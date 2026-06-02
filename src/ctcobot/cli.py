@@ -10,24 +10,11 @@ def cli():
     pass
 
 
-@cli.command()
-@click.option(
-    "--question", "-q",
-    required=True,
-    help="The HR policy question to ask.",
-)
-@click.option(
-    "--top-k", "-k",
-    default=5,
-    show_default=True,
-    help="Number of chunks to retrieve.",
-)
-def ask(question: str, top_k: int):
-    """Ask ctcobot an HR policy question."""
+def _load_kedro_params():
+    """Bootstrap Kedro and return the project parameters dict."""
     import sys
     from pathlib import Path
 
-    # Ensure src is on path when run directly
     src_path = Path(__file__).parent.parent
     if str(src_path) not in sys.path:
         sys.path.insert(0, str(src_path))
@@ -42,51 +29,71 @@ def ask(question: str, top_k: int):
 
     with KedroSession.create(project_path=project_path) as session:
         context = session.load_context()
-        params = context.params
+        return context.params
 
-    # Run querying nodes directly (faster than kedro run for interactive use)
-    from ctcobot.pipelines.querying.nodes import (
-        generate_hyde_doc,
-        embed_query, retrieve_chunks, build_prompt, generate_answer,
-    )
 
-    click.echo(f"\n🔍 Searching handbook for: {question}\n")
+@cli.command()
+@click.option(
+    "--question", "-q",
+    required=True,
+    help="The HR policy question to ask.",
+)
+@click.option(
+    "--top-k", "-k",
+    default=20,
+    show_default=True,
+    help="Number of chunks for VectorRAG retrieval before reranking.",
+)
+def ask(question: str, top_k: int):
+    """Ask ctcobot an HR policy question (agentic multi-RAG)."""
+    params = _load_kedro_params()
 
-    hyde_doc = generate_hyde_doc(
-        question=question,
+    from ctcobot.pipelines.querying.tools import VectorRAGTool, KeywordRAGTool  # GraphRAGTool disabled
+    from ctcobot.pipelines.querying.agent import QueryAgent
+
+    tools = {
+        "vector_rag": VectorRAGTool(
+            ollama_base_url=params["ollama_base_url"],
+            embedding_model=params["embedding_model"],
+            llm_model=params["llm_model"],
+            chroma_persist_path=params["chroma_persist_path"],
+            chroma_collection_name=params["chroma_collection_name"],
+            top_k=top_k,
+            reranker_model=params["reranker_model"],
+            rerank_top_n=params["rerank_top_n"],
+        ),
+        # graph_rag disabled until LightRAG index is built
+        # "graph_rag": GraphRAGTool(
+        #     lightrag_working_dir=params["lightrag_working_dir"],
+        #     ollama_base_url=params["ollama_base_url"],
+        #     llm_model=params["llm_model"],
+        #     embedding_model=params["embedding_model"],
+        # ),
+        "keyword_rag": KeywordRAGTool(
+            chroma_persist_path=params["chroma_persist_path"],
+            chroma_collection_name=params["chroma_collection_name"],
+            top_k=params["bm25_top_k"],
+        ),
+    }
+
+    agent = QueryAgent(
+        tools=tools,
         ollama_base_url=params["ollama_base_url"],
+        agent_model=params["agent_model"],
         llm_model=params["llm_model"],
     )
 
-    embedding = embed_query(
-        question=hyde_doc,
-        ollama_base_url=params["ollama_base_url"],
-        embedding_model=params["embedding_model"],
-    )
+    click.echo(f"\nSearching handbook for: {question}\n")
+    result = agent.run(question)
 
-    chunks = retrieve_chunks(
-        query_embedding=embedding,
-        chroma_persist_path=params["chroma_persist_path"],
-        chroma_collection_name=params["chroma_collection_name"],
-        top_k=top_k,
-    )
-
-    prompt_data = build_prompt(question=question, chunks=chunks)
-
-    result = generate_answer(
-        prompt_data=prompt_data,
-        ollama_base_url=params["ollama_base_url"],
-        llm_model=params["llm_model"],
-    )
-
-    # Print answer
     click.echo("─" * 60)
-    click.echo("📋 ANSWER")
+    click.echo("ANSWER")
     click.echo("─" * 60)
     click.echo(result["answer"])
 
-    # Print sources
-    click.echo("\n📄 SOURCES")
+    click.echo(f"\nTools used: {', '.join(result['tools_used']) or 'none'}")
+
+    click.echo("\nSOURCES")
     click.echo("─" * 60)
     for i, source in enumerate(result["sources"], start=1):
         click.echo(f"  {i}. {source['source_path']}  (score: {source['score']})")
@@ -95,32 +102,51 @@ def ask(question: str, top_k: int):
 
 @cli.command()
 def index():
-    """Run the full indexing pipeline (ingest, clean, chunk, embed)."""
+    """Run the full vector indexing pipeline (ingest, clean, chunk, embed)."""
     import subprocess
-    click.echo("🔄 Running indexing pipeline...")
+    click.echo("Running indexing pipeline...")
     result = subprocess.run(
         ["kedro", "run", "--pipeline", "indexing"],
         capture_output=False,
     )
     if result.returncode == 0:
-        click.echo("✅ Indexing complete.")
+        click.echo("Indexing complete.")
     else:
-        click.echo("❌ Indexing failed. Check logs above.")
+        click.echo("Indexing failed. Check logs above.")
+
+
+@cli.command("index_graph")
+def index_graph():
+    """Build the LightRAG knowledge graph index (run after index)."""
+    import subprocess
+    click.echo("Building LightRAG knowledge graph index...")
+    click.echo("(This is slow — many LLM calls for entity/relationship extraction.)")
+    result = subprocess.run(
+        ["kedro", "run", "--pipeline", "lightrag_indexing"],
+        capture_output=False,
+    )
+    if result.returncode == 0:
+        click.echo("LightRAG indexing complete.")
+    else:
+        click.echo("LightRAG indexing failed. Check logs above.")
 
 
 @cli.command()
 def evaluate():
     """Run the benchmark evaluation pipeline."""
     import subprocess
-    click.echo("📊 Running evaluation pipeline...")
+    click.echo("Running evaluation pipeline...")
     result = subprocess.run(
         ["kedro", "run", "--pipeline", "evaluation"],
         capture_output=False,
     )
     if result.returncode == 0:
-        click.echo("✅ Evaluation complete. Results in data/08_reporting/")
+        click.echo("Evaluation complete. Results in data/08_reporting/")
     else:
-        click.echo("❌ Evaluation failed. Check logs above.")
+        click.echo("Evaluation failed. Check logs above.")
+
+
+run = cli
 
 
 def main():

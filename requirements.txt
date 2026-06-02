@@ -24,3 +24,7 @@ kedro-datasets[pandas-csvdataset, pandas-parquetdataset, json-jsondataset]>=3.0
 # Utilities
 python-dotenv>=1.0.0
 tenacity>=8.3.0
+
+# v3.0 — Agentic Multi-RAG
+lightrag-hku>=1.3.9
+rank-bm25>=0.2.2

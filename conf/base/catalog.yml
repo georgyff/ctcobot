@@ -75,3 +75,10 @@ benchmark_report:
 benchmark_report_csv:
   type: pandas.CSVDataset
   filepath: data/08_reporting/benchmark_report.csv
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LightRAG indexing output
+# ══════════════════════════════════════════════════════════════════════════════
+lightrag_index_result:
+  type: json.JSONDataset
+  filepath: data/07_model_output/lightrag_index_result.json
