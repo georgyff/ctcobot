@@ -420,7 +420,7 @@ def save_benchmark_report(
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "3.0",
+        "benchmark_version": "3.4",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -475,7 +475,7 @@ def save_benchmark_report(
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v3.0")
+    print("  ctcobot BENCHMARK REPORT v3.4")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

@@ -52,7 +52,7 @@ def build_lightrag_index(
         llm_model_name=llm_model,
         llm_model_kwargs={
             "host": ollama_base_url,
-            "options": {"num_ctx": 4096},
+            "options": {"num_ctx": 8192},
         },
         embedding_func=EmbeddingFunc(
             embedding_dim=768,
@@ -76,16 +76,19 @@ def build_lightrag_index(
     )
     texts = [d["text"] for d in docs]
 
+    batch_size = 20
+    batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
     errors = 0
-    with tqdm(texts, desc="Indexing docs", unit="doc", dynamic_ncols=True) as pbar:
-        for i, text in enumerate(pbar):
+    with tqdm(batches, desc="Indexing docs", unit="batch", dynamic_ncols=True) as pbar:
+        for i, batch in enumerate(pbar):
             try:
-                rag.insert(text)
+                rag.insert(batch)
             except Exception as e:
                 errors += 1
-                logger.warning("Doc %d failed: %s", i, e)
+                logger.warning("Batch %d failed: %s", i, e)
+            docs_done = min((i + 1) * batch_size, len(texts))
             status = "ok" if errors == 0 else f"{errors} err"
-            pbar.set_postfix(status=status)
+            pbar.set_postfix(docs=f"{docs_done}/{len(texts)}", status=status)
 
     logger.info("LightRAG indexing complete.")
     return {"status": "indexed", "num_docs": len(texts), "working_dir": lightrag_working_dir}

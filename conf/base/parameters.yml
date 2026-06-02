@@ -50,5 +50,5 @@ lightrag_index_folders:         # only these handbook folders are graph-indexed
   - people-policies
   - people-group
   - hiring
-  - total-rewards
   - legal
+  - company
