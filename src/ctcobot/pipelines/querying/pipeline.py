@@ -36,8 +36,7 @@ def create_pipeline(**kwargs) -> Pipeline:
             func=retrieve_chunks,
             inputs=[
                 "query_embedding",
-                "params:chroma_persist_path",
-                "params:chroma_collection_name",
+                "params:turbovec_persist_path",
                 "params:top_k",
             ],
             outputs="retrieved_chunks",

@@ -45,53 +45,31 @@ def _load_kedro_params():
     help="Number of chunks for VectorRAG retrieval before reranking.",
 )
 def ask(question: str, top_k: int):
-    """Ask ctcobot an HR policy question (agentic multi-RAG)."""
+    """Ask ctcobot an HR policy question (HyDE vector RAG)."""
     params = _load_kedro_params()
 
-    from ctcobot.pipelines.querying.tools import VectorRAGTool, KeywordRAGTool  # GraphRAGTool disabled
-    from ctcobot.pipelines.querying.agent import QueryAgent
+    from ctcobot.pipelines.querying.tools import VectorRAGTool
+    from ctcobot.pipelines.querying.nodes import build_prompt, generate_answer
 
-    tools = {
-        "vector_rag": VectorRAGTool(
-            ollama_base_url=params["ollama_base_url"],
-            embedding_model=params["embedding_model"],
-            llm_model=params["llm_model"],
-            chroma_persist_path=params["chroma_persist_path"],
-            chroma_collection_name=params["chroma_collection_name"],
-            top_k=top_k,
-            reranker_model=params["reranker_model"],
-            rerank_top_n=params["rerank_top_n"],
-        ),
-        # graph_rag disabled until LightRAG index is built
-        # "graph_rag": GraphRAGTool(
-        #     lightrag_working_dir=params["lightrag_working_dir"],
-        #     ollama_base_url=params["ollama_base_url"],
-        #     llm_model=params["llm_model"],
-        #     embedding_model=params["embedding_model"],
-        # ),
-        "keyword_rag": KeywordRAGTool(
-            chroma_persist_path=params["chroma_persist_path"],
-            chroma_collection_name=params["chroma_collection_name"],
-            top_k=params["bm25_top_k"],
-        ),
-    }
-
-    agent = QueryAgent(
-        tools=tools,
+    tool = VectorRAGTool(
         ollama_base_url=params["ollama_base_url"],
-        agent_model=params["agent_model"],
+        embedding_model=params["embedding_model"],
         llm_model=params["llm_model"],
+        turbovec_persist_path=params["turbovec_persist_path"],
+        top_k=top_k,
+        reranker_model=params["reranker_model"],
+        rerank_top_n=params["rerank_top_n"],
     )
 
     click.echo(f"\nSearching handbook for: {question}\n")
-    result = agent.run(question)
+    chunks = tool(question)
+    prompt_data = build_prompt(question, chunks)
+    result = generate_answer(prompt_data, params["ollama_base_url"], params["llm_model"])
 
     click.echo("─" * 60)
     click.echo("ANSWER")
     click.echo("─" * 60)
     click.echo(result["answer"])
-
-    click.echo(f"\nTools used: {', '.join(result['tools_used']) or 'none'}")
 
     click.echo("\nSOURCES")
     click.echo("─" * 60)

@@ -1,7 +1,12 @@
 """
 Querying pipeline nodes — hyde, embed, retrieve, rerank, prompt, generate.
 """
+import json
 import logging
+from pathlib import Path
+
+import numpy as np
+from turbovec import TurboQuantIndex
 
 logger = logging.getLogger(__name__)
 
@@ -169,50 +174,53 @@ def embed_query(
     return embedding
 
 
+def _load_turbovec(turbovec_persist_path: str):
+    """Load turbovec index and metadata sidecar from disk."""
+    meta_path = Path(turbovec_persist_path) / "meta.json"
+    index_path = str(Path(turbovec_persist_path) / "index.tq")
+    with open(meta_path) as f:
+        meta_doc = json.load(f)
+    index = TurboQuantIndex.load(index_path)
+    return index, meta_doc["chunks"]
+
+
 def retrieve_chunks(
     query_embedding: list[float],
-    chroma_persist_path: str,
-    chroma_collection_name: str,
+    turbovec_persist_path: str,
     top_k: int,
 ) -> list[dict]:
     """
-    Retrieve top-k most relevant chunks from ChromaDB.
+    Retrieve top-k most relevant chunks from the turbovec index.
 
     Args:
-        query_embedding:        Embedded query vector.
-        chroma_persist_path:    Path to ChromaDB persistent store.
-        chroma_collection_name: ChromaDB collection name.
-        top_k:                  Number of chunks to retrieve.
+        query_embedding:       Embedded query vector (will be L2-normalized).
+        turbovec_persist_path: Directory containing index.tq and meta.json.
+        top_k:                 Number of chunks to retrieve.
 
     Returns:
         List of chunk dicts with keys: text, source_path, folder,
         filename, chunk_index, score.
     """
-    import chromadb
+    index, chunk_meta = _load_turbovec(turbovec_persist_path)
 
-    client = chromadb.PersistentClient(path=chroma_persist_path)
-    collection = client.get_collection(name=chroma_collection_name)
+    q = np.array(query_embedding, dtype=np.float32)
+    norm = np.linalg.norm(q)
+    if norm > 0:
+        q = q / norm
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"],
-    )
+    scores, indices = index.search(q[np.newaxis, :], k=top_k)
 
-    chunks = []
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
-    distances = results["distances"][0]
-
-    for text, metadata, distance in zip(documents, metadatas, distances):
-        chunks.append({
-            "text": text,
-            "source_path": metadata.get("source_path", "unknown"),
-            "folder": metadata.get("folder", "unknown"),
-            "filename": metadata.get("filename", "unknown"),
-            "chunk_index": metadata.get("chunk_index", 0),
-            "score": round(1 - distance, 4),  # cosine similarity
-        })
+    chunks = [
+        {
+            "text": chunk_meta[i]["text"],
+            "source_path": chunk_meta[i]["source_path"],
+            "folder": chunk_meta[i]["folder"],
+            "filename": chunk_meta[i]["filename"],
+            "chunk_index": chunk_meta[i]["chunk_index"],
+            "score": round(float(s), 4),
+        }
+        for s, i in zip(scores[0], indices[0])
+    ]
 
     logger.info("Retrieved %d chunks. Top score: %s", len(chunks), chunks[0]["score"] if chunks else "n/a")
     return chunks
@@ -223,69 +231,62 @@ def retrieve_chunks_multi(
     sub_queries: list[str],
     ollama_base_url: str,
     embedding_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
+    turbovec_persist_path: str,
     top_k: int,
 ) -> list[dict]:
     """
     Retrieve chunks using the HyDE embedding plus one embedding per sub-query.
 
-    Each query hits ChromaDB independently for top_k results. Results are merged
-    and deduplicated by (source_path, chunk_index), keeping the highest score per
-    chunk. This grows the candidate pool from top_k to roughly
-    (1 + len(sub_queries)) * top_k unique chunks, improving recall without
-    changing the index.
+    Each query searches the turbovec index independently for top_k results.
+    Results are merged and deduplicated by (source_path, chunk_index), keeping
+    the highest score per chunk.
 
     Args:
-        query_embedding:        Embedded HyDE document vector.
-        sub_queries:            Sub-questions to also retrieve for (may be empty).
-        ollama_base_url:        Ollama server URL.
-        embedding_model:        Ollama embedding model name.
-        chroma_persist_path:    Path to ChromaDB persistent store.
-        chroma_collection_name: ChromaDB collection name.
-        top_k:                  Number of chunks to retrieve per query.
+        query_embedding:       Embedded HyDE document vector.
+        sub_queries:           Sub-questions to also retrieve for (may be empty).
+        ollama_base_url:       Ollama server URL.
+        embedding_model:       Ollama embedding model name.
+        turbovec_persist_path: Directory containing index.tq and meta.json.
+        top_k:                 Number of chunks to retrieve per query.
 
     Returns:
         Deduplicated list of chunk dicts sorted by score descending.
     """
-    import chromadb
     import ollama as _ollama
 
-    chroma_client = chromadb.PersistentClient(path=chroma_persist_path)
-    collection = chroma_client.get_collection(name=chroma_collection_name)
+    index, chunk_meta = _load_turbovec(turbovec_persist_path)
     oc = _ollama.Client(host=ollama_base_url)
 
-    all_embeddings = [query_embedding]
+    raw_embeddings = [query_embedding]
     for sub_q in sub_queries:
         resp = oc.embeddings(model=embedding_model, prompt=sub_q)
-        all_embeddings.append(resp["embedding"])
+        raw_embeddings.append(resp["embedding"])
 
     seen: dict[tuple, dict] = {}
-    for emb in all_embeddings:
-        results = collection.query(
-            query_embeddings=[emb],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"],
-        )
-        for text, meta, dist in zip(
-            results["documents"][0], results["metadatas"][0], results["distances"][0]
-        ):
-            key = (meta.get("source_path", ""), meta.get("chunk_index", 0))
-            score = round(1 - dist, 4)
+    for raw_emb in raw_embeddings:
+        q = np.array(raw_emb, dtype=np.float32)
+        norm = np.linalg.norm(q)
+        if norm > 0:
+            q = q / norm
+        scores, indices = index.search(q[np.newaxis, :], k=top_k)
+        for s, i in zip(scores[0], indices[0]):
+            m = chunk_meta[i]
+            key = (m["source_path"], m["chunk_index"])
+            score = round(float(s), 4)
             if key not in seen or score > seen[key]["score"]:
                 seen[key] = {
-                    "text": text,
-                    "source_path": meta.get("source_path", "unknown"),
-                    "folder": meta.get("folder", "unknown"),
-                    "filename": meta.get("filename", "unknown"),
-                    "chunk_index": meta.get("chunk_index", 0),
+                    "text": m["text"],
+                    "source_path": m["source_path"],
+                    "folder": m["folder"],
+                    "filename": m["filename"],
+                    "chunk_index": m["chunk_index"],
                     "score": score,
                 }
 
     chunks = sorted(seen.values(), key=lambda c: c["score"], reverse=True)
     logger.info(
         "Multi-query retrieved %d unique chunks from %d queries.",
-        len(chunks), len(all_embeddings),
+        len(chunks), len(raw_embeddings),
     )
     return chunks
 

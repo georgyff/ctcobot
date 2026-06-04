@@ -9,11 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import ollama
-import chromadb
 import pandas as pd
 
-from ctcobot.pipelines.querying.agent import QueryAgent
-from ctcobot.pipelines.querying.tools import GraphRAGTool, KeywordRAGTool, VectorRAGTool
+from ctcobot.pipelines.querying.nodes import build_prompt, generate_answer
+from ctcobot.pipelines.querying.tools import VectorRAGTool
 from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
 
 logger = logging.getLogger(__name__)
@@ -24,72 +23,50 @@ def run_eval_pipeline(
     ollama_base_url: str,
     embedding_model: str,
     llm_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
+    turbovec_persist_path: str,
     top_k: int,
     reranker_model: str,
     rerank_top_n: int,
-    lightrag_working_dir: str,
-    agent_model: str,
 ) -> list[dict]:
     """
-    Run the full agentic RAG pipeline once per QA pair (v3.0).
+    Run the HyDE vector RAG pipeline once per QA pair.
 
-    Initialises the QueryAgent once with all three tools, then calls agent.run()
-    per question. Captures pre-rerank sources from VectorRAGTool (for retrieval
-    metrics), generated answers (for quality metrics), and tools_used per question.
+    Uses VectorRAGTool directly (HyDE → embed → turbovec → rerank → generate).
+    Captures pre-rerank sources for retrieval metrics and the generated answer
+    for quality metrics.
     """
-    vector_tool = VectorRAGTool(
+    tool = VectorRAGTool(
         ollama_base_url=ollama_base_url,
         embedding_model=embedding_model,
         llm_model=llm_model,
-        chroma_persist_path=chroma_persist_path,
-        chroma_collection_name=chroma_collection_name,
+        turbovec_persist_path=turbovec_persist_path,
         top_k=top_k,
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
-    )
-    tools = {
-        "vector_rag": vector_tool,
-        "graph_rag": GraphRAGTool(
-            lightrag_working_dir=lightrag_working_dir,
-            ollama_base_url=ollama_base_url,
-            llm_model=llm_model,
-            embedding_model=embedding_model,
-        ),
-        "keyword_rag": KeywordRAGTool(
-            chroma_persist_path=chroma_persist_path,
-            chroma_collection_name=chroma_collection_name,
-            top_k=top_k,
-        ),
-    }
-    agent = QueryAgent(
-        tools=tools,
-        ollama_base_url=ollama_base_url,
-        agent_model=agent_model,
-        llm_model=llm_model,
     )
 
     results = []
 
     for _, row in eval_qa_pairs.iterrows():
         question = row["question"]
-        logger.info("Running agent for: %s", question[:60])
+        logger.info("Running pipeline for: %s", question[:60])
 
         try:
-            agent_result = agent.run(question)
+            chunks = tool(question)
+            prompt_data = build_prompt(question, chunks)
+            result = generate_answer(prompt_data, ollama_base_url, llm_model)
             results.append({
                 "question": question,
                 "expected_source": row["source_file"],
                 "expected_answer": row["expected_answer"],
-                "pre_rerank_sources": agent_result.get("pre_rerank_sources", []),
-                "answer": agent_result["answer"],
-                "sources": agent_result["sources"],
-                "tools_used": agent_result.get("tools_used", []),
+                "pre_rerank_sources": tool.last_pre_rerank_sources,
+                "answer": result["answer"],
+                "sources": result["sources"],
+                "tools_used": ["vector_rag"],
                 "error": None,
             })
         except Exception as e:
-            logger.warning("Agent failed for: %s — %s", question[:50], e)
+            logger.warning("Pipeline failed for: %s — %s", question[:50], e)
             results.append({
                 "question": question,
                 "expected_source": row["source_file"],
@@ -107,28 +84,20 @@ def run_eval_pipeline(
 
 def compute_retrieval_metrics(
     qa_eval_results: list[dict],
-    chroma_persist_path: str,
-    chroma_collection_name: str,
+    turbovec_persist_path: str,
     top_k: int,
 ) -> dict:
     """
     Compute retrieval metrics (hit rate, MRR, precision, recall) from pre-rerank chunk data.
     """
-    chroma_client = chromadb.PersistentClient(path=chroma_persist_path)
-    collection = chroma_client.get_collection(name=chroma_collection_name)
+    meta_path = Path(turbovec_persist_path) / "meta.json"
+    with open(meta_path) as f:
+        meta_doc = json.load(f)
 
     source_chunk_counts: dict[str, int] = {}
-    batch_size = 500
-    offset = 0
-    while True:
-        batch = collection.get(include=["metadatas"], limit=batch_size, offset=offset)
-        metas = batch.get("metadatas") or []
-        for meta in metas:
-            src = meta.get("source_path", "")
-            source_chunk_counts[src] = source_chunk_counts.get(src, 0) + 1
-        if len(metas) < batch_size:
-            break
-        offset += batch_size
+    for m in meta_doc["chunks"]:
+        src = m.get("source_path", "")
+        source_chunk_counts[src] = source_chunk_counts.get(src, 0) + 1
 
     results = []
     hits = 0
@@ -295,53 +264,30 @@ def run_latency_eval(
     ollama_base_url: str,
     embedding_model: str,
     llm_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
+    turbovec_persist_path: str,
     top_k: int,
     reranker_model: str,
     rerank_top_n: int,
     eval_latency_questions: list[str],
     eval_num_latency_runs: int,
-    lightrag_working_dir: str,
-    agent_model: str,
 ) -> dict:
     """
-    Measure end-to-end agentic query pipeline latency (v3.0).
+    Measure end-to-end HyDE vector RAG pipeline latency.
 
-    Initialises QueryAgent once, then times agent.run() per question so latency
-    includes tool-selection, retrieval, and answer synthesis.
+    Times VectorRAGTool + build_prompt + generate_answer per question so latency
+    includes HyDE generation, embedding, retrieval, reranking, and answer synthesis.
 
     Returns:
         Dict with p50, p95, p99 latencies and per-run timings.
     """
-    tools = {
-        "vector_rag": VectorRAGTool(
-            ollama_base_url=ollama_base_url,
-            embedding_model=embedding_model,
-            llm_model=llm_model,
-            chroma_persist_path=chroma_persist_path,
-            chroma_collection_name=chroma_collection_name,
-            top_k=top_k,
-            reranker_model=reranker_model,
-            rerank_top_n=rerank_top_n,
-        ),
-        "graph_rag": GraphRAGTool(
-            lightrag_working_dir=lightrag_working_dir,
-            ollama_base_url=ollama_base_url,
-            llm_model=llm_model,
-            embedding_model=embedding_model,
-        ),
-        "keyword_rag": KeywordRAGTool(
-            chroma_persist_path=chroma_persist_path,
-            chroma_collection_name=chroma_collection_name,
-            top_k=top_k,
-        ),
-    }
-    agent = QueryAgent(
-        tools=tools,
+    tool = VectorRAGTool(
         ollama_base_url=ollama_base_url,
-        agent_model=agent_model,
+        embedding_model=embedding_model,
         llm_model=llm_model,
+        turbovec_persist_path=turbovec_persist_path,
+        top_k=top_k,
+        reranker_model=reranker_model,
+        rerank_top_n=rerank_top_n,
     )
 
     latencies = []
@@ -358,7 +304,9 @@ def run_latency_eval(
         t_start = time.perf_counter()
 
         try:
-            agent.run(question)
+            chunks = tool(question)
+            prompt_data = build_prompt(question, chunks)
+            generate_answer(prompt_data, ollama_base_url, llm_model)
             elapsed = time.perf_counter() - t_start
             latencies.append(elapsed)
             logger.info("Run %d/%d: %.2fs", i + 1, eval_num_latency_runs, elapsed)
@@ -412,15 +360,13 @@ def save_benchmark_report(
     Returns:
         Aggregated benchmark report dict.
     """
-    # Compute tools_used distribution from quality details (stored in qa_eval_results via
-    # run_eval_pipeline, but quality_results only has answers — derive from details)
     all_tools: list[str] = []
     for item in quality_results.get("details", []):
         all_tools.extend(item.get("tools_used", []))
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "3.4",
+        "benchmark_version": "4.2",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -469,13 +415,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v3-0.json")
+    report_path = Path("data/08_reporting/benchmark_report_v4-2.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v3.4")
+    print("  ctcobot BENCHMARK REPORT v4.2")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

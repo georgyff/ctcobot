@@ -1,14 +1,16 @@
 """
 Indexing pipeline nodes — T-07: ingest_documents
 """
+import json
 import logging
 from pathlib import Path
 import re
 import frontmatter
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import tiktoken
+import numpy as np
 import ollama
-import chromadb
+import tiktoken
+from turbovec import TurboQuantIndex
 
 logger = logging.getLogger(__name__)
 
@@ -210,32 +212,27 @@ def embed_and_index(
     chunks: list[dict],
     ollama_base_url: str,
     embedding_model: str,
-    chroma_persist_path: str,
-    chroma_collection_name: str,
+    turbovec_persist_path: str,
 ) -> dict:
     """
-    Embed all chunks using Ollama and upsert into ChromaDB.
+    Embed all chunks using Ollama and build a turbovec TurboQuantIndex.
+
+    Saves two files into turbovec_persist_path:
+      - index.tq   — turbovec binary (quantized vectors, row i = chunk i)
+      - meta.json  — parallel chunk metadata + index config
 
     Args:
-        chunks:                 Output of chunk_documents.
-        ollama_base_url:        Ollama server URL.
-        embedding_model:        Ollama embedding model name.
-        chroma_persist_path:    Path to persist ChromaDB.
-        chroma_collection_name: ChromaDB collection name.
+        chunks:                Output of chunk_documents.
+        ollama_base_url:       Ollama server URL.
+        embedding_model:       Ollama embedding model name.
+        turbovec_persist_path: Directory to persist the index and metadata.
 
     Returns:
         Dict with indexing summary stats.
     """
-
-    # Initialise ChromaDB persistent client
-    Path(chroma_persist_path).mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=chroma_persist_path)
-
-    # Get or create collection (cosine similarity)
-    collection = client.get_or_create_collection(
-        name=chroma_collection_name,
-        metadata={"hnsw:space": "cosine"},
-    )
+    Path(turbovec_persist_path).mkdir(parents=True, exist_ok=True)
+    index_path = str(Path(turbovec_persist_path) / "index.tq")
+    meta_path = str(Path(turbovec_persist_path) / "meta.json")
 
     ollama_client = ollama.Client(host=ollama_base_url)
 
@@ -243,14 +240,11 @@ def embed_and_index(
     total = len(chunks)
     indexed = 0
     errors = 0
+    all_embeddings: list[np.ndarray] = []
+    all_meta: list[dict] = []
 
     for batch_start in range(0, total, BATCH_SIZE):
         batch = chunks[batch_start: batch_start + BATCH_SIZE]
-
-        ids = []
-        embeddings = []
-        documents = []
-        metadatas = []
 
         for chunk in batch:
             try:
@@ -258,42 +252,40 @@ def embed_and_index(
                     model=embedding_model,
                     prompt=chunk["text"],
                 )
-                embedding = response["embedding"]
-
-                ids.append(chunk["chunk_id"])
-                embeddings.append(embedding)
-                documents.append(chunk["text"])
-                metadatas.append({
+                emb = np.array(response["embedding"], dtype=np.float32)
+                norm = np.linalg.norm(emb)
+                if norm > 0:
+                    emb = emb / norm
+                all_embeddings.append(emb)
+                all_meta.append({
+                    "text": chunk["text"],
                     "source_path": chunk["source_path"],
                     "folder": chunk["folder"],
                     "filename": chunk["filename"],
                     "chunk_index": chunk["chunk_index"],
-                    "total_chunks": chunk["total_chunks"],
-                    "token_count": chunk["token_count"],
                 })
                 indexed += 1
-
             except Exception as e:
                 logger.warning(f"Failed to embed chunk {chunk['chunk_id']}: {e}")
                 errors += 1
 
-        if ids:
-            collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                documents=documents,
-                metadatas=metadatas,
-            )
-
         if batch_start % 500 == 0:
-            logger.info(f"Progress: {batch_start}/{total} chunks indexed...")
+            logger.info(f"Progress: {batch_start}/{total} chunks embedded...")
+
+    vectors = np.stack(all_embeddings)  # shape (indexed, dim)
+    dim = vectors.shape[1]
+    index = TurboQuantIndex(dim=dim, bit_width=4)
+    index.add(vectors)
+    index.write(index_path)
+
+    with open(meta_path, "w") as f:
+        json.dump({"dim": dim, "bit_width": 4, "chunks": all_meta}, f)
 
     summary = {
         "total_chunks": total,
         "indexed": indexed,
         "errors": errors,
-        "collection": chroma_collection_name,
-        "chroma_path": chroma_persist_path,
+        "turbovec_path": turbovec_persist_path,
     }
     logger.info(f"Indexing complete: {summary}")
     return summary

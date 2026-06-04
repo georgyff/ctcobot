@@ -7,11 +7,11 @@ chunk_overlap: 50        # token overlap between consecutive chunks
 encoding_name: "cl100k_base"   # tiktoken encoding (matches gpt-4o-mini & embeddings)
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
-top_k: 20                 # number of chunks to retrieve before reranking
+top_k: 10                 # number of chunks to retrieve before reranking
 
 # ── Reranker ──────────────────────────────────────────────────────────────────
 reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within documents
-rerank_top_n: 7          # chunks kept after reranking
+rerank_top_n: 5          # chunks kept after reranking
 
 # ── Models ────────────────────────────────────────────────────────────────────
 embedding_model: "nomic-embed-text"
@@ -19,9 +19,8 @@ llm_model: "qwen3.5:4b"
 judge_model: "qwen3.5:4b"
 ollama_base_url: "http://localhost:11434"
 
-# ── ChromaDB ──────────────────────────────────────────────────────────────────
-chroma_collection_name: "ctcobot_handbook"
-chroma_persist_path: "data/04_feature/chroma_db"
+# ── TurboVec index ────────────────────────────────────────────────────────────
+turbovec_persist_path: "data/04_feature/turbovec_db"
 
 # ── Corpus ────────────────────────────────────────────────────────────────────
 raw_data_path: "data/01_raw/gitlab_handbook"
@@ -42,10 +41,8 @@ priority_folders:
   - "total-rewards"
   - "people-policies"
 
-# ── Agent (v3.0) ──────────────────────────────────────────────────────────────
-agent_model: "qwen3.5:4b"       # model used for tool-calling routing decisions
+# ── LightRAG ──────────────────────────────────────────────────────────────────
 lightrag_working_dir: "data/04_feature/lightrag_db"
-bm25_top_k: 10                  # keyword chunks returned by KeywordRAGTool
 lightrag_index_folders:         # only these handbook folders are graph-indexed
   - people-policies
   - people-group
