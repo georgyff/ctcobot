@@ -184,6 +184,151 @@ def _load_turbovec(turbovec_persist_path: str):
     return index, meta_doc["chunks"]
 
 
+def _list_folders(turbovec_persist_path: str) -> list[str]:
+    """Return the sorted set of top-level folder names present in the index."""
+    meta_path = Path(turbovec_persist_path) / "meta.json"
+    with open(meta_path) as f:
+        meta_doc = json.load(f)
+    folders = {c.get("folder", "") for c in meta_doc["chunks"]}
+    folders.discard("")
+    return sorted(folders)
+
+
+def rank_folders(
+    question: str,
+    turbovec_persist_path: str,
+    ollama_base_url: str,
+    llm_model: str,
+) -> list[str]:
+    """
+    Use the LLM to rank handbook folders by likelihood of containing the answer.
+
+    Reads the folder set from meta.json, asks the LLM to order them MOST→LEAST
+    relevant, and returns a deduplicated ranked list. Any folder the LLM omits
+    is appended at the end so callers always see the full set.
+
+    Args:
+        question:              The original user question.
+        turbovec_persist_path: Directory containing meta.json.
+        ollama_base_url:       Ollama server URL.
+        llm_model:             Model used for folder ranking.
+
+    Returns:
+        Ranked list of folder names (MOST relevant first).
+    """
+    import re
+    import ollama
+    from ctcobot.prompt_templates import FOLDER_RANK_SYSTEM_PROMPT
+
+    folders = _list_folders(turbovec_persist_path)
+    user_msg = (
+        f"Question: {question}\n\n"
+        f"Folders:\n" + "\n".join(f"- {f}" for f in folders)
+    )
+
+    client = ollama.Client(host=ollama_base_url)
+    try:
+        response = client.chat(
+            model=llm_model,
+            messages=[
+                {"role": "system", "content": FOLDER_RANK_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            think=False,
+        )
+        raw = response["message"]["content"].strip()
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        ranked = json.loads(match.group()) if match else []
+    except Exception as e:
+        logger.warning("Folder ranking failed (%s); using alphabetical order", e)
+        ranked = []
+
+    folder_set = set(folders)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for f in ranked:
+        if isinstance(f, str) and f in folder_set and f not in seen:
+            seen.add(f)
+            ordered.append(f)
+    for f in folders:
+        if f not in seen:
+            ordered.append(f)
+
+    logger.info("Folder ranking (top 5): %s", ordered[:5])
+    return ordered
+
+
+def retrieve_chunks_folder_priority(
+    query_embedding: list[float],
+    ranked_folders: list[str],
+    turbovec_persist_path: str,
+    top_k: int,
+    top_folders: int,
+    retrieve_oversample: int,
+) -> list[dict]:
+    """
+    Retrieve chunks restricted to the top-N ranked folders.
+
+    Oversamples (top_k × retrieve_oversample) from the full index, filters to
+    chunks whose folder is in the top-N ranked folders, and returns the top
+    ``top_k`` survivors in score order. Falls back to the unfiltered top_k if
+    the folder filter would yield zero chunks.
+
+    Args:
+        query_embedding:       Embedded query vector (will be L2-normalized).
+        ranked_folders:        Folders ordered MOST→LEAST relevant (from
+                               rank_folders).
+        turbovec_persist_path: Directory containing index.tq and meta.json.
+        top_k:                 Final number of chunks to return.
+        top_folders:           Number of top-ranked folders to keep.
+        retrieve_oversample:   Multiplier on top_k for the index pre-search.
+
+    Returns:
+        List of chunk dicts with keys: text, source_path, folder,
+        filename, chunk_index, score.
+    """
+    index, chunk_meta = _load_turbovec(turbovec_persist_path)
+    priority_set = set(ranked_folders[:top_folders])
+
+    q = np.array(query_embedding, dtype=np.float32)
+    norm = np.linalg.norm(q)
+    if norm > 0:
+        q = q / norm
+
+    oversample_k = max(top_k, top_k * retrieve_oversample)
+    oversample_k = min(oversample_k, len(chunk_meta))
+    scores, indices = index.search(q[np.newaxis, :], k=oversample_k)
+
+    all_hits = [
+        {
+            "text": chunk_meta[i]["text"],
+            "source_path": chunk_meta[i]["source_path"],
+            "folder": chunk_meta[i]["folder"],
+            "filename": chunk_meta[i]["filename"],
+            "chunk_index": chunk_meta[i]["chunk_index"],
+            "score": round(float(s), 4),
+        }
+        for s, i in zip(scores[0], indices[0])
+    ]
+
+    filtered = [c for c in all_hits if c["folder"] in priority_set]
+    if not filtered:
+        logger.warning(
+            "Folder filter (top=%s) yielded 0 chunks; falling back to unfiltered top_k",
+            list(priority_set),
+        )
+        chunks = all_hits[:top_k]
+    else:
+        chunks = filtered[:top_k]
+
+    logger.info(
+        "Folder-priority retrieved %d chunks. Priority folders: %s. Top score: %s",
+        len(chunks), list(priority_set),
+        chunks[0]["score"] if chunks else "n/a",
+    )
+    return chunks
+
+
 def retrieve_chunks(
     query_embedding: list[float],
     turbovec_persist_path: str,
@@ -413,6 +558,8 @@ def generate_answer(
 
     Returns:
         Dict with keys: question, answer, sources, model.
+        
+    Do not rely on your training knowledge; only state what appears verbatim in the excerpts.
     """
     import ollama
 

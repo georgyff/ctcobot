@@ -3,7 +3,8 @@ from kedro.pipeline import Pipeline, node, pipeline
 from .nodes import (
     generate_hyde_doc,
     embed_query,
-    retrieve_chunks,
+    rank_folders,
+    retrieve_chunks_folder_priority,
     rerank_chunks,
     build_prompt,
     generate_answer,
@@ -33,11 +34,25 @@ def create_pipeline(**kwargs) -> Pipeline:
             name="embed_query_node",
         ),
         node(
-            func=retrieve_chunks,
+            func=rank_folders,
+            inputs=[
+                "params:question",
+                "params:turbovec_persist_path",
+                "params:ollama_base_url",
+                "params:llm_model",
+            ],
+            outputs="ranked_folders",
+            name="rank_folders_node",
+        ),
+        node(
+            func=retrieve_chunks_folder_priority,
             inputs=[
                 "query_embedding",
+                "ranked_folders",
                 "params:turbovec_persist_path",
                 "params:top_k",
+                "params:top_folders",
+                "params:retrieve_oversample",
             ],
             outputs="retrieved_chunks",
             name="retrieve_chunks_node",

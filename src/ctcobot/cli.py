@@ -59,6 +59,8 @@ def ask(question: str, top_k: int):
         top_k=top_k,
         reranker_model=params["reranker_model"],
         rerank_top_n=params["rerank_top_n"],
+        top_folders=params["top_folders"],
+        retrieve_oversample=params["retrieve_oversample"],
     )
 
     click.echo(f"\nSearching handbook for: {question}\n")

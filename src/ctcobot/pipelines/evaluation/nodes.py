@@ -27,11 +27,14 @@ def run_eval_pipeline(
     top_k: int,
     reranker_model: str,
     rerank_top_n: int,
+    top_folders: int,
+    retrieve_oversample: int,
 ) -> list[dict]:
     """
-    Run the HyDE vector RAG pipeline once per QA pair.
+    Run the HyDE + folder-priority vector RAG pipeline once per QA pair.
 
-    Uses VectorRAGTool directly (HyDE → embed → turbovec → rerank → generate).
+    Uses VectorRAGTool directly
+    (HyDE → embed → rank_folders → folder-priority retrieve → rerank → generate).
     Captures pre-rerank sources for retrieval metrics and the generated answer
     for quality metrics.
     """
@@ -43,6 +46,8 @@ def run_eval_pipeline(
         top_k=top_k,
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
+        top_folders=top_folders,
+        retrieve_oversample=retrieve_oversample,
     )
 
     results = []
@@ -268,14 +273,17 @@ def run_latency_eval(
     top_k: int,
     reranker_model: str,
     rerank_top_n: int,
+    top_folders: int,
+    retrieve_oversample: int,
     eval_latency_questions: list[str],
     eval_num_latency_runs: int,
 ) -> dict:
     """
-    Measure end-to-end HyDE vector RAG pipeline latency.
+    Measure end-to-end HyDE + folder-priority RAG pipeline latency.
 
     Times VectorRAGTool + build_prompt + generate_answer per question so latency
-    includes HyDE generation, embedding, retrieval, reranking, and answer synthesis.
+    includes HyDE generation, folder ranking, embedding, retrieval, reranking,
+    and answer synthesis.
 
     Returns:
         Dict with p50, p95, p99 latencies and per-run timings.
@@ -288,6 +296,8 @@ def run_latency_eval(
         top_k=top_k,
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
+        top_folders=top_folders,
+        retrieve_oversample=retrieve_oversample,
     )
 
     latencies = []
@@ -366,7 +376,7 @@ def save_benchmark_report(
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "4.2",
+        "benchmark_version": "4.4",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -415,13 +425,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v4-2.json")
+    report_path = Path("data/08_reporting/benchmark_report_v4-4.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v4.2")
+    print("  ctcobot BENCHMARK REPORT v4.4")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

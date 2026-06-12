@@ -9,6 +9,10 @@ encoding_name: "cl100k_base"   # tiktoken encoding (matches gpt-4o-mini & embedd
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 top_k: 10                 # number of chunks to retrieve before reranking
 
+# ── Folder routing ────────────────────────────────────────────────────────────
+top_folders: 5            # number of LLM-ranked folders to restrict retrieval to
+retrieve_oversample: 10   # multiplier on top_k for the pre-filter index search
+
 # ── Reranker ──────────────────────────────────────────────────────────────────
 reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within documents
 rerank_top_n: 5          # chunks kept after reranking
