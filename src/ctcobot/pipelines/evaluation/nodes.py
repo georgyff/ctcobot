@@ -56,10 +56,13 @@ def run_eval_pipeline(
         question = row["question"]
         logger.info("Running pipeline for: %s", question[:60])
 
+        t_start = time.perf_counter()
         try:
             chunks = tool(question)
             prompt_data = build_prompt(question, chunks)
             result = generate_answer(prompt_data, ollama_base_url, llm_model)
+            elapsed = time.perf_counter() - t_start
+            logger.info("Pipeline run: %.2fs | %s", elapsed, question[:60])
             results.append({
                 "question": question,
                 "expected_source": row["source_file"],
@@ -68,9 +71,11 @@ def run_eval_pipeline(
                 "answer": result["answer"],
                 "sources": result["sources"],
                 "tools_used": ["vector_rag"],
+                "latency_seconds": round(elapsed, 3),
                 "error": None,
             })
         except Exception as e:
+            elapsed = time.perf_counter() - t_start
             logger.warning("Pipeline failed for: %s — %s", question[:50], e)
             results.append({
                 "question": question,
@@ -80,6 +85,7 @@ def run_eval_pipeline(
                 "answer": "ERROR",
                 "sources": [],
                 "tools_used": [],
+                "latency_seconds": None,
                 "error": str(e),
             })
 
@@ -265,68 +271,31 @@ def compute_quality_metrics(
     }
 
 
-def run_latency_eval(
-    ollama_base_url: str,
-    embedding_model: str,
-    llm_model: str,
-    turbovec_persist_path: str,
-    top_k: int,
-    reranker_model: str,
-    rerank_top_n: int,
-    top_folders: int,
-    retrieve_oversample: int,
-    eval_latency_questions: list[str],
-    eval_num_latency_runs: int,
-) -> dict:
+def compute_latency_metrics(qa_eval_results: list[dict]) -> dict:
     """
-    Measure end-to-end HyDE + folder-priority RAG pipeline latency.
+    Compute latency percentiles from per-question timings recorded during
+    ``run_eval_pipeline``.
 
-    Times VectorRAGTool + build_prompt + generate_answer per question so latency
-    includes HyDE generation, folder ranking, embedding, retrieval, reranking,
-    and answer synthesis.
+    No separate latency loop is run — each of the 25 eval questions is timed
+    end-to-end (HyDE → folder rank → retrieve → rerank → answer) during the
+    main pipeline pass, and this node aggregates those timings.
+
+    Args:
+        qa_eval_results: Output of ``run_eval_pipeline``. Each entry must
+                         carry a ``latency_seconds`` field (``None`` on error).
 
     Returns:
-        Dict with p50, p95, p99 latencies and per-run timings.
+        Dict with p50, p95, p99, min, max, avg, and the sorted latency list.
+        Shape matches what ``save_benchmark_report`` expects.
     """
-    tool = VectorRAGTool(
-        ollama_base_url=ollama_base_url,
-        embedding_model=embedding_model,
-        llm_model=llm_model,
-        turbovec_persist_path=turbovec_persist_path,
-        top_k=top_k,
-        reranker_model=reranker_model,
-        rerank_top_n=rerank_top_n,
-        top_folders=top_folders,
-        retrieve_oversample=retrieve_oversample,
+    latencies = sorted(
+        r["latency_seconds"]
+        for r in qa_eval_results
+        if r.get("latency_seconds") is not None
     )
-
-    latencies = []
-    errors = 0
-    n_questions = len(eval_latency_questions)
-
-    logger.info(
-        "Starting latency eval: %d runs across %d questions...",
-        eval_num_latency_runs, n_questions,
-    )
-
-    for i in range(eval_num_latency_runs):
-        question = eval_latency_questions[i % n_questions]
-        t_start = time.perf_counter()
-
-        try:
-            chunks = tool(question)
-            prompt_data = build_prompt(question, chunks)
-            generate_answer(prompt_data, ollama_base_url, llm_model)
-            elapsed = time.perf_counter() - t_start
-            latencies.append(elapsed)
-            logger.info("Run %d/%d: %.2fs", i + 1, eval_num_latency_runs, elapsed)
-
-        except Exception as e:
-            logger.warning("Run %d failed: %s", i + 1, e)
-            errors += 1
-
-    latencies.sort()
     n = len(latencies)
+    total = len(qa_eval_results)
+    errors = total - n
 
     def percentile(data: list, p: int) -> float:
         if not data:
@@ -335,7 +304,7 @@ def run_latency_eval(
         return round(data[idx], 3)
 
     result = {
-        "total_runs": eval_num_latency_runs,
+        "total_runs": total,
         "successful_runs": n,
         "errors": errors,
         "p50_seconds": percentile(latencies, 50),
@@ -348,8 +317,8 @@ def run_latency_eval(
     }
 
     logger.info(
-        "Latency eval complete. P50=%.3fs | P95=%.3fs | P99=%.3fs",
-        result["p50_seconds"], result["p95_seconds"], result["p99_seconds"],
+        "Latency from eval run (n=%d): P50=%.3fs | P95=%.3fs | P99=%.3fs",
+        n, result["p50_seconds"], result["p95_seconds"], result["p99_seconds"],
     )
     return result
 
@@ -363,9 +332,10 @@ def save_benchmark_report(
     Aggregate all evaluation metrics into a single benchmark report.
 
     Args:
-        retrieval_results: Output of run_retrieval_eval.
-        quality_results:   Output of run_quality_eval.
-        latency_results:   Output of run_latency_eval.
+        retrieval_results: Output of compute_retrieval_metrics.
+        quality_results:   Output of compute_quality_metrics.
+        latency_results:   Output of compute_latency_metrics
+                           (derived from per-question timings in qa_eval_results).
 
     Returns:
         Aggregated benchmark report dict.
@@ -376,7 +346,7 @@ def save_benchmark_report(
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "4.4",
+        "benchmark_version": "4.6",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -425,13 +395,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v4-4.json")
+    report_path = Path("data/08_reporting/benchmark_report_v4-6.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v4.4")
+    print("  ctcobot BENCHMARK REPORT v4.6")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

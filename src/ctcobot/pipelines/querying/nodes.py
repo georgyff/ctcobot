@@ -194,6 +194,9 @@ def _list_folders(turbovec_persist_path: str) -> list[str]:
     return sorted(folders)
 
 
+FOLDER_RANK_TIMEOUT_SECONDS = 90
+
+
 def rank_folders(
     question: str,
     turbovec_persist_path: str,
@@ -203,9 +206,13 @@ def rank_folders(
     """
     Use the LLM to rank handbook folders by likelihood of containing the answer.
 
-    Reads the folder set from meta.json, asks the LLM to order them MOST→LEAST
-    relevant, and returns a deduplicated ranked list. Any folder the LLM omits
-    is appended at the end so callers always see the full set.
+    Uses Ollama's ``format="json"`` to constrain output to a valid JSON object
+    of shape ``{"ranked": ["folder1", ...]}``. On any failure (parse error,
+    timeout, hang, empty list) returns an **empty list** as a signal that the
+    folder filter should be skipped — ``retrieve_chunks_folder_priority`` then
+    falls back to plain top-k retrieval over the full index. This avoids the
+    earlier bug where a parse failure silently restricted retrieval to the
+    alphabetical first five folders (``about``, ``acquisitions``, ...).
 
     Args:
         question:              The original user question.
@@ -214,9 +221,9 @@ def rank_folders(
         llm_model:             Model used for folder ranking.
 
     Returns:
-        Ranked list of folder names (MOST relevant first).
+        Ranked folder list (MOST relevant first), or ``[]`` to signal
+        "skip the folder filter for this query".
     """
-    import re
     import ollama
     from ctcobot.prompt_templates import FOLDER_RANK_SYSTEM_PROMPT
 
@@ -226,7 +233,7 @@ def rank_folders(
         f"Folders:\n" + "\n".join(f"- {f}" for f in folders)
     )
 
-    client = ollama.Client(host=ollama_base_url)
+    client = ollama.Client(host=ollama_base_url, timeout=FOLDER_RANK_TIMEOUT_SECONDS)
     try:
         response = client.chat(
             model=llm_model,
@@ -234,13 +241,29 @@ def rank_folders(
                 {"role": "system", "content": FOLDER_RANK_SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ],
+            format="json",
             think=False,
         )
         raw = response["message"]["content"].strip()
-        match = re.search(r'\[.*\]', raw, re.DOTALL)
-        ranked = json.loads(match.group()) if match else []
+        parsed = json.loads(raw)
     except Exception as e:
-        logger.warning("Folder ranking failed (%s); using alphabetical order", e)
+        logger.warning(
+            "Folder ranking failed (%s); skipping folder filter for this query",
+            e,
+        )
+        return []
+
+    # Accept {"ranked": [...]}, bare [...], or {"<anything>": [...]}.
+    if isinstance(parsed, list):
+        ranked = parsed
+    elif isinstance(parsed, dict):
+        ranked = parsed.get("ranked")
+        if not isinstance(ranked, list):
+            ranked = next(
+                (v for v in parsed.values() if isinstance(v, list)),
+                [],
+            )
+    else:
         ranked = []
 
     folder_set = set(folders)
@@ -250,6 +273,15 @@ def rank_folders(
         if isinstance(f, str) and f in folder_set and f not in seen:
             seen.add(f)
             ordered.append(f)
+
+    if not ordered:
+        logger.warning(
+            "LLM returned no recognized folder names; skipping folder filter"
+        )
+        return []
+
+    # Pad with any folders the LLM omitted so downstream priority slicing is
+    # stable regardless of how many names the LLM emitted.
     for f in folders:
         if f not in seen:
             ordered.append(f)
@@ -288,15 +320,22 @@ def retrieve_chunks_folder_priority(
         filename, chunk_index, score.
     """
     index, chunk_meta = _load_turbovec(turbovec_persist_path)
-    priority_set = set(ranked_folders[:top_folders])
+
+    # Empty ranked_folders is the sentinel from rank_folders() meaning
+    # "ranking failed — skip the folder filter for this query".
+    skip_filter = not ranked_folders
+    priority_set = set(ranked_folders[:top_folders]) if not skip_filter else set()
 
     q = np.array(query_embedding, dtype=np.float32)
     norm = np.linalg.norm(q)
     if norm > 0:
         q = q / norm
 
-    oversample_k = max(top_k, top_k * retrieve_oversample)
-    oversample_k = min(oversample_k, len(chunk_meta))
+    if skip_filter:
+        oversample_k = min(top_k, len(chunk_meta))
+    else:
+        oversample_k = max(top_k, top_k * retrieve_oversample)
+        oversample_k = min(oversample_k, len(chunk_meta))
     scores, indices = index.search(q[np.newaxis, :], k=oversample_k)
 
     all_hits = [
@@ -310,6 +349,15 @@ def retrieve_chunks_folder_priority(
         }
         for s, i in zip(scores[0], indices[0])
     ]
+
+    if skip_filter:
+        chunks = all_hits[:top_k]
+        logger.info(
+            "Folder filter SKIPPED (ranking unavailable); retrieved %d chunks. "
+            "Top score: %s",
+            len(chunks), chunks[0]["score"] if chunks else "n/a",
+        )
+        return chunks
 
     filtered = [c for c in all_hits if c["folder"] in priority_set]
     if not filtered:
@@ -438,8 +486,15 @@ def retrieve_chunks_multi(
 
 RERANK_PROMPT = (
     "You are a relevance reranker. Given a question and numbered excerpts, "
-    "output a JSON array of excerpt numbers ranked from MOST to LEAST relevant. "
-    "Include every number. Output ONLY the JSON array, nothing else.\n\n"
+    "rank them from MOST to LEAST relevant to answering the specific question. "
+    "Prefer excerpts that DIRECTLY answer the question — containing the "
+    "actual fact, definition, procedure, or contact information being asked "
+    "for. Demote excerpts that only mention the topic in passing or that "
+    "describe a related but different policy. "
+    "Do not bias toward chunks with more numbers or longer text; "
+    "judge each chunk by whether its content answers THIS question. "
+    "Include every excerpt number exactly once. "
+    "Output ONLY the JSON array, nothing else.\n\n"
     "Example output: [3, 1, 5, 2, 4]"
 )
 
@@ -472,7 +527,7 @@ def rerank_chunks(
         return chunks
 
     excerpt_lines = "\n\n".join(
-        f"[{i+1}] {chunk['text'].strip()[:400]}"
+        f"[{i+1}] {chunk['text'].strip()[:700]}"
         for i, chunk in enumerate(chunks)
     )
     user_msg = f"Question: {question}\n\nExcerpts:\n{excerpt_lines}"

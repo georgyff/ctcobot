@@ -30,6 +30,35 @@ You will be given a question and a set of excerpts from the company handbook.
 - Do not omit enumerated items (contact methods, eligibility criteria,
   bullet points) that appear in the excerpts.
 
+## Distinguish similar policies, but do not over-split a single policy
+- These pairs look similar but apply to different contexts; keep them
+  separate when answering:
+    - **US leave-of-absence** (administered through Tilt) is NOT the
+      same as the general **time-off / time-away philosophy** (Workday).
+    - **Anti-harassment reporting** (Chief People Officer, Team Member
+      Relations, People Business Partner) is NOT the same as
+      **ethics-and-compliance reporting** (Chief Legal Officer,
+      EthicsPoint, Lighthouse Services), and neither is the same as
+      **anti-fraud reporting**.
+- When the question is about ONE specific policy, answer from that
+  policy's excerpts only. Do not import contact channels, reporting
+  paths, or eligibility rules from a different policy.
+- HOWEVER, a single policy often has multiple legitimate sub-cases
+  (e.g., RSU vesting: new-hire grant vs refresh grant vs promotion
+  grant; or stock options: legacy schedule vs current grants). When the
+  excerpts describe these sub-cases, present the one(s) the question
+  asks about clearly. Do not append contradictory notes that undermine
+  your own answer (e.g., do not say "this applies to existing
+  employees" after correctly describing new-hire vesting).
+
+## Describe what the excerpts say, even when restrictions are noted
+- If the excerpts state that a grant type is no longer issued ("we no
+  longer grant new X"), that a program changed ("as of date Y, the
+  policy is..."), or that a sub-case is rare, still describe what the
+  excerpts say about the schedule, eligibility, or procedure as
+  documented. Do not refuse to answer about an existing policy schedule
+  just because new instances are no longer being created.
+
 Be factual, concise, and professional. Match the level of detail present
 in the excerpts; do not over-condense."""
 
@@ -76,15 +105,17 @@ def format_rag_prompt(question: str, context: str) -> str:
 FOLDER_RANK_SYSTEM_PROMPT = (
     "You are a routing assistant for an HR policy retrieval system. "
     "The company handbook is split into top-level folders. Given a user "
-    "question and the full list of folders, rank ALL folders from MOST to "
-    "LEAST likely to contain the answer. "
-    "Consider folder names literally: e.g. compensation/equity questions "
-    "belong in 'total-rewards', harassment/EEO/relations in 'people-group' "
-    "or 'people-policies', leave/PTO in 'people-policies', whistleblowing/"
-    "compliance in 'legal'. Engineering/marketing/sales/security/product "
-    "folders almost never contain HR policy answers. "
-    "Output ONLY a JSON array of folder names in ranked order. Include "
-    "every folder exactly once. No prose."
+    "question and the full list of folders, return the TOP 10 folders MOST "
+    "likely to contain the answer, ordered from most to least relevant. "
+    "Use folder names literally: compensation/equity questions → "
+    "'total-rewards'; harassment/EEO/relations → 'people-group' or "
+    "'people-policies'; leave/PTO → 'people-policies'; whistleblowing/"
+    "compliance → 'legal'. Engineering/marketing/sales/security/product "
+    "folders almost never contain HR policy answers — exclude them unless "
+    "the question is clearly about those domains. "
+    'Output ONLY a JSON object of the form '
+    '{"ranked": ["folder1", "folder2", ...]} with up to 10 folder names. '
+    "No prose, no markdown."
 )
 
 

@@ -7,15 +7,18 @@ chunk_overlap: 50        # token overlap between consecutive chunks
 encoding_name: "cl100k_base"   # tiktoken encoding (matches gpt-4o-mini & embeddings)
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
-top_k: 10                 # number of chunks to retrieve before reranking
+top_k: 10                 # reverted from 20 in v4.6 — folder filter keeps the
+                          # pool clean; 20 added noise without quality gain
 
 # ── Folder routing ────────────────────────────────────────────────────────────
-top_folders: 5            # number of LLM-ranked folders to restrict retrieval to
+top_folders: 7            # widened from 5 → 7 in v4.6 to give headroom against
+                          # folder mis-routing (v4.5 missed people-group on 3 queries)
 retrieve_oversample: 10   # multiplier on top_k for the pre-filter index search
 
 # ── Reranker ──────────────────────────────────────────────────────────────────
 reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within documents
-rerank_top_n: 5          # chunks kept after reranking
+rerank_top_n: 6          # 5 (v4.4) → 8 (v4.5 — too many, confused answer LLM)
+                          # → 6 (v4.6 compromise)
 
 # ── Models ────────────────────────────────────────────────────────────────────
 embedding_model: "nomic-embed-text"
@@ -31,13 +34,8 @@ raw_data_path: "data/01_raw/gitlab_handbook"
 min_doc_tokens: 50       # documents shorter than this are filtered out
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
-eval_num_latency_runs: 20        # total query runs for latency measurement
-eval_latency_questions:          # fixed question set used for latency eval
-  - "What is the expense reimbursement policy?"
-  - "How do I report a security incident?"
-  - "What is the policy on outside employment?"
-  - "How many days of PTO are employees entitled to?"
-  - "What are the data retention requirements?"
+# Latency is derived from per-question timings in run_eval_pipeline; no
+# separate latency loop is run.
 
 priority_folders:
   - "legal"

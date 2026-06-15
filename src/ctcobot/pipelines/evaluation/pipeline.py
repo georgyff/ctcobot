@@ -4,7 +4,7 @@ from .nodes import (
     run_eval_pipeline,
     compute_retrieval_metrics,
     compute_quality_metrics,
-    run_latency_eval,
+    compute_latency_metrics,
     save_benchmark_report,
 )
 
@@ -49,22 +49,10 @@ def create_pipeline(**kwargs) -> Pipeline:
             name="compute_quality_metrics_node",
         ),
         node(
-            func=run_latency_eval,
-            inputs=[
-                "params:ollama_base_url",
-                "params:embedding_model",
-                "params:llm_model",
-                "params:turbovec_persist_path",
-                "params:top_k",
-                "params:reranker_model",
-                "params:rerank_top_n",
-                "params:top_folders",
-                "params:retrieve_oversample",
-                "params:eval_latency_questions",
-                "params:eval_num_latency_runs",
-            ],
+            func=compute_latency_metrics,
+            inputs="qa_eval_results",
             outputs="latency_results",
-            name="run_latency_eval_node",
+            name="compute_latency_metrics_node",
         ),
         node(
             func=save_benchmark_report,
