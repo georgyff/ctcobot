@@ -53,6 +53,7 @@ def create_pipeline(**kwargs) -> Pipeline:
                 "params:top_k",
                 "params:top_folders",
                 "params:retrieve_oversample",
+                "params:priority_folders",
             ],
             outputs="retrieved_chunks",
             name="retrieve_chunks_node",

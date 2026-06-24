@@ -110,7 +110,13 @@ FOLDER_RANK_SYSTEM_PROMPT = (
     "Use folder names literally: compensation/equity questions → "
     "'total-rewards'; harassment/EEO/relations → 'people-group' or "
     "'people-policies'; leave/PTO → 'people-policies'; whistleblowing/"
-    "compliance → 'legal'. Engineering/marketing/sales/security/product "
+    "compliance → 'legal'. "
+    "Performance and talent topics — talent assessment, performance review, "
+    "the 9-box / performance-growth-potential matrix, growth potential, TNTR "
+    "(Too New To Rate), succession planning, calibration, and 360 feedback — "
+    "live in 'people-group' (NOT 'hiring', NOT 'total-rewards', NOT "
+    "'company'); always rank 'people-group' near the top for these. "
+    "Engineering/marketing/sales/security/product "
     "folders almost never contain HR policy answers — exclude them unless "
     "the question is clearly about those domains. "
     'Output ONLY a JSON object of the form '
@@ -126,6 +132,77 @@ HYDE_SYSTEM_PROMPT = (
     "Do not mention the question — write only the policy text. "
     "Output ONLY the paragraph, nothing else."
 )
+
+
+# ── Agentic routing ───────────────────────────────────────────────────────────
+
+AGENT_SYSTEM_PROMPT = (
+    "You are a retrieval router for an HR policy assistant. You decide how to "
+    "fetch handbook excerpts to answer an employee's question by calling one or "
+    "both of the available search tools. You do NOT answer the question yourself "
+    "— you only choose the tool(s).\n\n"
+    "Tools:\n"
+    "- vector_rag: semantic / meaning-based search. Best for conceptual, "
+    "paraphrased, or open-ended questions: 'what is the purpose of X', 'how does "
+    "Y work', 'is Z allowed', 'explain the policy on ...'. This is the default "
+    "choice for most questions.\n"
+    "- keyword_rag: exact lexical / keyword search. Best when the question hinges "
+    "on a specific literal term the handbook would contain verbatim: acronyms "
+    "(TNTR, FMLA, CFRA, EEO, RSU), short codes, model names ('9-box'), exact "
+    "form names, email addresses, or proper nouns.\n\n"
+    "Routing rules:\n"
+    "- For a purely conceptual question, call vector_rag.\n"
+    "- For a question that turns on a specific acronym, code, or exact term, "
+    "call keyword_rag.\n"
+    "- When a question mixes a concept with a specific term, call BOTH tools.\n"
+    "- Always call at least one tool. Pass the user's question as the 'query'.\n"
+)
+
+# Ollama tool-calling schemas for the router. Each tool takes the question text.
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "vector_rag",
+            "description": (
+                "Semantic vector search over the handbook (HyDE embedding + "
+                "folder-scoped retrieval + rerank). Use for conceptual or "
+                "paraphrased questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The employee's question, verbatim.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keyword_rag",
+            "description": (
+                "Exact keyword (BM25) search over the handbook, folder-scoped. "
+                "Use for acronyms, codes, model names, exact terms, or proper "
+                "nouns the handbook contains verbatim."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The employee's question, verbatim.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
 
 
 JUDGE_PROMPT = """You are an expert evaluator assessing the quality of an AI assistant's answer to an HR policy question.

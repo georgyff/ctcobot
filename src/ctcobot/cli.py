@@ -45,13 +45,13 @@ def _load_kedro_params():
     help="Number of chunks for VectorRAG retrieval before reranking.",
 )
 def ask(question: str, top_k: int):
-    """Ask ctcobot an HR policy question (HyDE vector RAG)."""
+    """Ask ctcobot an HR policy question (agentic vector + BM25 RAG)."""
     params = _load_kedro_params()
 
-    from ctcobot.pipelines.querying.tools import VectorRAGTool
-    from ctcobot.pipelines.querying.nodes import build_prompt, generate_answer
+    from ctcobot.pipelines.querying.tools import VectorRAGTool, KeywordRAGTool
+    from ctcobot.pipelines.querying.agent import QueryAgent
 
-    tool = VectorRAGTool(
+    vector_tool = VectorRAGTool(
         ollama_base_url=params["ollama_base_url"],
         embedding_model=params["embedding_model"],
         llm_model=params["llm_model"],
@@ -61,17 +61,35 @@ def ask(question: str, top_k: int):
         rerank_top_n=params["rerank_top_n"],
         top_folders=params["top_folders"],
         retrieve_oversample=params["retrieve_oversample"],
+        priority_folders=params["priority_folders"],
+    )
+    keyword_tool = KeywordRAGTool(
+        ollama_base_url=params["ollama_base_url"],
+        llm_model=params["llm_model"],
+        turbovec_persist_path=params["turbovec_persist_path"],
+        top_k=params["bm25_top_k"],
+        top_folders=params["top_folders"],
+        priority_folders=params["priority_folders"],
+    )
+    agent = QueryAgent(
+        tools={"vector_rag": vector_tool, "keyword_rag": keyword_tool},
+        ollama_base_url=params["ollama_base_url"],
+        agent_model=params["agent_model"],
+        llm_model=params["llm_model"],
+        reranker_model=params["reranker_model"],
+        rerank_top_n=params["rerank_top_n"],
+        turbovec_persist_path=params["turbovec_persist_path"],
     )
 
     click.echo(f"\nSearching handbook for: {question}\n")
-    chunks = tool(question)
-    prompt_data = build_prompt(question, chunks)
-    result = generate_answer(prompt_data, params["ollama_base_url"], params["llm_model"])
+    result = agent.run(question)
 
     click.echo("─" * 60)
     click.echo("ANSWER")
     click.echo("─" * 60)
     click.echo(result["answer"])
+
+    click.echo(f"\nTools used: {', '.join(result['tools_used'])}")
 
     click.echo("\nSOURCES")
     click.echo("─" * 60)

@@ -20,6 +20,10 @@ reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within docu
 rerank_top_n: 6          # 5 (v4.4) → 8 (v4.5 — too many, confused answer LLM)
                           # → 6 (v4.6 compromise)
 
+# ── Agentic routing (v5.0) ────────────────────────────────────────────────────
+agent_model: "qwen3.5:4b"   # tool-calling router that picks vector_rag / keyword_rag
+bm25_top_k: 10              # BM25 candidates returned before merge + rerank
+
 # ── Models ────────────────────────────────────────────────────────────────────
 embedding_model: "nomic-embed-text"
 llm_model: "qwen3.5:4b"

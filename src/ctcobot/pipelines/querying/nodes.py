@@ -297,6 +297,7 @@ def retrieve_chunks_folder_priority(
     top_k: int,
     top_folders: int,
     retrieve_oversample: int,
+    priority_folders: list[str] | None = None,
 ) -> list[dict]:
     """
     Retrieve chunks restricted to the top-N ranked folders.
@@ -306,6 +307,10 @@ def retrieve_chunks_folder_priority(
     ``top_k`` survivors in score order. Falls back to the unfiltered top_k if
     the folder filter would yield zero chunks.
 
+    ``priority_folders`` are always unioned into the filter set, so the
+    canonical HR folders remain candidates even when the LLM folder ranker
+    omits them (the v5.0 talent-assessment misses) or fails entirely.
+
     Args:
         query_embedding:       Embedded query vector (will be L2-normalized).
         ranked_folders:        Folders ordered MOST→LEAST relevant (from
@@ -314,6 +319,7 @@ def retrieve_chunks_folder_priority(
         top_k:                 Final number of chunks to return.
         top_folders:           Number of top-ranked folders to keep.
         retrieve_oversample:   Multiplier on top_k for the index pre-search.
+        priority_folders:      Folders always included in the filter set.
 
     Returns:
         List of chunk dicts with keys: text, source_path, folder,
@@ -321,10 +327,12 @@ def retrieve_chunks_folder_priority(
     """
     index, chunk_meta = _load_turbovec(turbovec_persist_path)
 
-    # Empty ranked_folders is the sentinel from rank_folders() meaning
-    # "ranking failed — skip the folder filter for this query".
-    skip_filter = not ranked_folders
-    priority_set = set(ranked_folders[:top_folders]) if not skip_filter else set()
+    floor = set(priority_folders or [])
+    # The filter set is the LLM's top-N ranked folders plus the always-on HR
+    # floor. Only skip filtering when BOTH are empty (ranking failed and no
+    # floor configured).
+    priority_set = set(ranked_folders[:top_folders]) | floor
+    skip_filter = not priority_set
 
     q = np.array(query_embedding, dtype=np.float32)
     norm = np.linalg.norm(q)

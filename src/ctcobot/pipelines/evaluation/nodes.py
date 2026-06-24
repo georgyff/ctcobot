@@ -11,8 +11,8 @@ from pathlib import Path
 import ollama
 import pandas as pd
 
-from ctcobot.pipelines.querying.nodes import build_prompt, generate_answer
-from ctcobot.pipelines.querying.tools import VectorRAGTool
+from ctcobot.pipelines.querying.agent import QueryAgent
+from ctcobot.pipelines.querying.tools import KeywordRAGTool, VectorRAGTool
 from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
 
 logger = logging.getLogger(__name__)
@@ -29,16 +29,21 @@ def run_eval_pipeline(
     rerank_top_n: int,
     top_folders: int,
     retrieve_oversample: int,
+    agent_model: str,
+    bm25_top_k: int,
+    priority_folders: list[str],
 ) -> list[dict]:
     """
-    Run the HyDE + folder-priority vector RAG pipeline once per QA pair.
+    Run the agentic RAG pipeline once per QA pair.
 
-    Uses VectorRAGTool directly
-    (HyDE → embed → rank_folders → folder-priority retrieve → rerank → generate).
-    Captures pre-rerank sources for retrieval metrics and the generated answer
-    for quality metrics.
+    A QueryAgent always runs the vector HyDE tool and, when the router or the
+    acronym heuristic calls for it, also the folder-scoped BM25 keyword tool;
+    it merges + reranks the results and generates the answer. Both tools share
+    a guaranteed HR-folder floor (``priority_folders``). Captures the union of
+    pre-rerank sources (for retrieval metrics), which tool(s) were used, and
+    the answer (for quality).
     """
-    tool = VectorRAGTool(
+    vector_tool = VectorRAGTool(
         ollama_base_url=ollama_base_url,
         embedding_model=embedding_model,
         llm_model=llm_model,
@@ -48,6 +53,24 @@ def run_eval_pipeline(
         rerank_top_n=rerank_top_n,
         top_folders=top_folders,
         retrieve_oversample=retrieve_oversample,
+        priority_folders=priority_folders,
+    )
+    keyword_tool = KeywordRAGTool(
+        ollama_base_url=ollama_base_url,
+        llm_model=llm_model,
+        turbovec_persist_path=turbovec_persist_path,
+        top_k=bm25_top_k,
+        top_folders=top_folders,
+        priority_folders=priority_folders,
+    )
+    agent = QueryAgent(
+        tools={"vector_rag": vector_tool, "keyword_rag": keyword_tool},
+        ollama_base_url=ollama_base_url,
+        agent_model=agent_model,
+        llm_model=llm_model,
+        reranker_model=reranker_model,
+        rerank_top_n=rerank_top_n,
+        turbovec_persist_path=turbovec_persist_path,
     )
 
     results = []
@@ -58,19 +81,20 @@ def run_eval_pipeline(
 
         t_start = time.perf_counter()
         try:
-            chunks = tool(question)
-            prompt_data = build_prompt(question, chunks)
-            result = generate_answer(prompt_data, ollama_base_url, llm_model)
+            result = agent.run(question)
             elapsed = time.perf_counter() - t_start
-            logger.info("Pipeline run: %.2fs | %s", elapsed, question[:60])
+            logger.info(
+                "Pipeline run: %.2fs | tools=%s | %s",
+                elapsed, result["tools_used"], question[:60],
+            )
             results.append({
                 "question": question,
                 "expected_source": row["source_file"],
                 "expected_answer": row["expected_answer"],
-                "pre_rerank_sources": tool.last_pre_rerank_sources,
+                "pre_rerank_sources": result["pre_rerank_sources"],
                 "answer": result["answer"],
                 "sources": result["sources"],
-                "tools_used": ["vector_rag"],
+                "tools_used": result["tools_used"],
                 "latency_seconds": round(elapsed, 3),
                 "error": None,
             })
@@ -346,7 +370,7 @@ def save_benchmark_report(
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "4.6",
+        "benchmark_version": "5.1",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_5": 0.70,
@@ -395,13 +419,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v4-6.json")
+    report_path = Path("data/08_reporting/benchmark_report_v5-1.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v4.6")
+    print("  ctcobot BENCHMARK REPORT v5.1")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")
