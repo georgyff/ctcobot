@@ -370,3 +370,132 @@ Very poor retrieval — too few docs and sections selected.
 | v2.5 | 3.20 | 1.00 | 0.704 | 607 | Major retrieval improvements |
 | v2.6 | 2.60 | 1.00 | 0.649 | 510 | Pre-rank cap + original question for Stage 2 (regression) |
 | v2.7 | 2.48 | 0.96 | 0.596 | 694 | Post-rank diversity, expanded_question restored, top_sections=8 |
+| v3.0 | 2.82 | 0.52 | 0.412 | 554 | Agentic (HyDE-vector + BM25 + LightRAG). All 11 score-1 failures from BM25 corpus pollution |
+| v4.1 | 4.24 | 1.00 | 0.863 | 127 | Agent removed; linear HyDE vector pipeline |
+| v4.4 | 4.28 | 1.00 | 0.887 | 122 | Tightened SYSTEM_PROMPT + LLM folder ranking (rank_folders) |
+| v4.6 | 4.20 | 0.96 | 0.778 | 184 | top_folders 5→7, softened prompt; MRR regressed |
+| v5.0 | 4.12 | 0.88 | 0.793 | 143 | Agentic v2 (vector + folder-scoped BM25); folder router dropped people-group → 3 talent misses |
+| v5.1 | 4.40 | 1.00 | 0.810 | 141 | priority_folders floor + always-run-vector + prompt fix; best quality so far |
+| v5.2 | 4.59 | 1.00 | 0.815 | 180 | Eval-metric fixes (recall_pass first time), QA broadening, 4b agent reranker (9-box 1→5) |
+| v5.3 | 4.60 | 0.931 | 0.776 | 211 | Re-keyed student-loan QA + verified refusal; low-temp answer/judge/rerank (variance control) |
+| v5.4 | TBD | TBD | TBD | TBD | Answer-directness directive (lead with the answer, caveats second, no padding) — targets buried score-1 vesting answer |
+
+---
+
+## Series 3 — Agentic Multi-Tool (`agentic-ver` branch)
+
+`QueryAgent` (Ollama tool-calling, `MAX_TOOL_ROUNDS=3`) routed between
+`VectorRAGTool` (HyDE), `KeywordRAGTool` (BM25), `GraphRAGTool` (LightRAG).
+**v3.0** crashed to quality 2.82 — all 11 score-1 failures came from the BM25
+tool matching surface keywords across the 48k-chunk engineering-dominated corpus.
+Lesson: unscoped BM25 pollutes HR answers. Architecture abandoned.
+
+## Series 4 — HyDE Vector + Folder Routing (`main`)
+
+Linear pipeline, no agent. **v4.1** removed the agent (quality 4.24). **v4.4**
+added the two load-bearing pieces — a tightened grounding SYSTEM_PROMPT and an
+LLM **folder-ranking** pre-filter (`rank_folders` → `retrieve_chunks_folder_priority`),
+reaching the project's then-best **4.28 / Hit 1.00 / MRR 0.887**. v4.5/v4.6
+experimented with reranker bias and `top_folders` (5→7); quality held ~4.2 but
+MRR regressed (folder pool too wide).
+
+## Series 5 — Agentic v2: Vector floor + folder-scoped BM25 (`main`)
+
+Re-introduced the agent, but with the Series 3 lesson baked in.
+
+### v5.0 (2026-06-23)
+`QueryAgent` routes between the existing `VectorRAGTool` and a new
+**folder-scoped** `KeywordRAGTool` (BM25 restricted to the question's top ranked
+folders — the v3.0 fix). Smart tokenizer preserves acronyms/`9-box`; cached
+index; acronym safety-net forces keyword_rag for TNTR/9-box-style questions.
+**Regressed** to 4.12 / Hit 0.88: the shared `rank_folders` call dropped
+`people-group` for the 3 talent-assessment questions, and BM25-only routing
+amplified the miss into score-1s.
+
+### v5.1 (2026-06-24)
+Three fixes: (1) **priority_folders floor** — the unused `priority_folders`
+param (legal, people-group, total-rewards, people-policies) is now always
+unioned into the retrieval filter, so HR folders survive folder-router variance;
+(2) **always-run-vector floor** — `vector_rag` always runs, keyword_rag only
+augments (no keyword-only misses); (3) folder-rank prompt taught the
+performance/talent cluster → people-group. Result: **best version yet — quality
+4.40, Hit 1.00, MRR 0.810**; the 3 talent misses recovered.
+
+### v5.2 (2026-06-25)
+Error analysis of v5.1 found eval-harness bugs and one real model gap. Changes:
+- **Eval-metric correctness** (`compute_retrieval_metrics`): metrics now run on a
+  deduped `(source_path, chunk_index)` candidate set (`last_pre_rerank_chunks`),
+  truncated to a fixed `retrieval_eval_k=10` for every question. Fixes
+  **recall > 1.0** (was counting duplicate source occurrences vs unique chunks),
+  the variable-k inconsistency (10 vs 20 by tool selection), the mislabeled
+  "@5" (computed over the full union — a rank-11 "hit" was counted), and caps
+  recall at `min(total_relevant, k)` so it's reachable. Report keys renamed
+  `hit_rate_at_5 → hit_rate_at_k`, `top_k → retrieval_eval_k`.
+- **Stronger agent reranker**: new `agent_reranker_model` (`qwen3.5:4b`) reranks
+  the merged union only (where cross-folder BM25 noise concentrates); the vector
+  tool keeps its internal 0.8b reranker. Targets the 9-box failure (right doc
+  retrieved but definition chunk demoted under `company`/`business-technology`
+  noise).
+- **QA dataset**: verified Q26 (consult attorney) and Q9 (PBP + leader) are
+  **correctly keyed** (verbatim in the source docs) — their failures are
+  retrieval-precision, not dataset faults, so they were kept. Added 3 grounded
+  coverage pairs (values, legal/whistleblowing, security) to test routing
+  breadth beyond the original 7 docs / 3 folders, plus 1 **out-of-scope refusal
+  case** (student-loan repayment, absent from the corpus; `source_file="-"` so it
+  is excluded from retrieval metrics and only scored on correct refusal).
+
+Result: **best version yet — Quality 4.59, Hit 1.00, MRR 0.815, and
+`recall_pass: true` for the first time.** 9-box recovered to score 5; the new
+coverage questions (values/legal/security) all scored 5.
+
+### v5.3 (2026-06-25)
+Error analysis of v5.2 found two of the three remaining sub-4 scores were not
+real model gaps:
+- **Invalid refusal QA pair (self-inflicted)**: the v5.2 student-loan refusal
+  case was wrong — GitLab *does* offer Student Loan Support (SoFi refinancing,
+  `total-rewards/.../inc-benefits-us/_index.md:597`). The v5.2 absence check
+  searched one phrase ("student loan repayment", 0 hits) instead of the concept.
+  Fix: re-keyed that row to the true grounded SoFi answer (now a valid coverage
+  question) and added a **properly concept-verified** refusal case (four-day /
+  compressed work week — 0 corpus hits across phrasings). Lesson: verify absence
+  by concept, not a single string.
+- **Uncontrolled sampling temperature** caused a garbled self-contradicting
+  stock-option answer (score 1; the same question scored 5 in v5.1) and the
+  project's chronic run-to-run variance (e.g. v4.1→v4.2 4.24→3.80 on identical
+  config). `generate_answer` and the judge ran at Ollama's default (~0.8). Fix:
+  `generate_answer` now uses `temperature 0.2` + `num_predict 800` (coherent,
+  bounded); the **judge uses `temperature 0.0`** (deterministic, reproducible
+  scoring); `rerank_chunks` uses `temperature 0.0`. Added a SYSTEM_PROMPT
+  coherence line forbidding self-contradiction.
+
+**Result:** best version yet — **Quality 4.60, Hit 0.931, MRR 0.776**, all
+retrieval + quality targets pass. All three fixes validated: student-loan and
+the new four-day-week refusal both scored 5, and the previously-garbled
+stock-option-*exercise* answer is now coherent (score 5). The two retrieval
+misses (Hit 0.931) were verified as **honest, correctly-keyed** top-10 misses
+masked by answer-equivalent sibling docs (whistleblowing↔anti-retaliation;
+security/_index↔sirt subdocs) — both answers still scored 5, so they are kept
+as genuine signal, not dataset bugs.
+
+### v5.4 (2026-06-25)
+Error analysis of v5.3 left only three sub-4 scores, all on the one long,
+multi-topic doc `total-rewards/stock-options.md`. The biggest was a **score-1
+on "What is GitLab's stock option vesting schedule?" despite perfect retrieval
+(rank 1, P=1.0)**: the answer actually *stated* the correct legacy "1-year cliff
++ 3 years monthly" schedule, but the model **opened** with the caveat "GitLab is
+not currently issuing options" and buried the real answer under unasked-for RSU
+detail, so the judge read the opening as a refusal and scored 1. This is purely
+an answer-ordering problem — the content was already correct.
+- **Fix (prompt-only, lowest-risk lever):** added a SYSTEM_PROMPT
+  **answer-directness** directive — lead with the specific thing asked
+  (schedule / contact / purpose) in the first sentence; state any restriction or
+  caveat *after* the direct answer, never as the opening; and do not pad with
+  adjacent sub-topics the question didn't ask about (e.g. RSU vesting when asked
+  about stock-option vesting). Retrieval for this question is already perfect, so
+  no retrieval/rerank change was warranted.
+- **Deferred (per conservative scope):** the two remaining score-2s are
+  retrieval/rerank-precision issues on a single dense `stock-options.md` chunk
+  (the "consult an employment attorney/tax advisor" passage and the
+  equity-compensation-guide intro out-ranked by `compensation/_index.md`).
+  Fixing them means touching `RERANK_PROMPT`/`rerank_top_n`, which risks the 25
+  currently-perfect answers — not worth it on the best version.

@@ -506,6 +506,13 @@ RERANK_PROMPT = (
     "Example output: [3, 1, 5, 2, 4]"
 )
 
+# Bound the reranker call so a stalled/runaway generation can't hang the
+# pipeline; on timeout rerank_chunks falls back to the original score order.
+RERANK_TIMEOUT_SECONDS = 180
+
+# Generous bound for answer generation (real answers can be long).
+GENERATE_TIMEOUT_SECONDS = 300
+
 
 def rerank_chunks(
     chunks: list[dict],
@@ -540,7 +547,11 @@ def rerank_chunks(
     )
     user_msg = f"Question: {question}\n\nExcerpts:\n{excerpt_lines}"
 
-    client = ollama.Client(host=ollama_base_url)
+    # The reranker only needs to emit a short JSON array of indices. Cap the
+    # output (num_predict) so a heavier model can't run away into a multi-minute
+    # generation, and bound the call with a timeout. On any failure (timeout,
+    # parse error) we fall back to the original score order below.
+    client = ollama.Client(host=ollama_base_url, timeout=RERANK_TIMEOUT_SECONDS)
     try:
         response = client.chat(
             model=reranker_model,
@@ -549,6 +560,7 @@ def rerank_chunks(
                 {"role": "user", "content": user_msg},
             ],
             think=False,
+            options={"num_predict": 256, "temperature": 0.0},
         )
         raw = response["message"]["content"].strip()
         match = re.search(r'\[[\d,\s]+\]', raw)
@@ -626,7 +638,8 @@ def generate_answer(
     """
     import ollama
 
-    client = ollama.Client(host=ollama_base_url)
+    # Generous bound so answer generation can't hang the run indefinitely.
+    client = ollama.Client(host=ollama_base_url, timeout=GENERATE_TIMEOUT_SECONDS)
 
     response = client.chat(
         model=llm_model,
@@ -635,6 +648,10 @@ def generate_answer(
             {"role": "user", "content": prompt_data["user_prompt"]},
         ],
         think=False,
+        # Low temperature for coherent, reproducible answers (avoids the
+        # high-temperature self-contradiction loop); num_predict bounds any
+        # runaway repetition while still allowing full answers.
+        options={"temperature": 0.2, "num_predict": 800},
     )
 
     answer = response["message"]["content"].strip()

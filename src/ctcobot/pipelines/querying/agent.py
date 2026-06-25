@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 3
 
+# Bound the routing LLM call; on timeout the agent falls back to vector_rag.
+ROUTE_TIMEOUT_SECONDS = 60
+
 # Heuristic safety net: questions hinging on an acronym, a quoted phrase, or a
 # hyphenated alphanumeric term (e.g. TNTR, "Too New To Rate", 9-box) should
 # always reach BM25 even if the LLM router does not pick it. This directly
@@ -58,23 +61,28 @@ class QueryAgent:
         reranker_model: str,
         rerank_top_n: int,
         turbovec_persist_path: str,
+        agent_reranker_model: str | None = None,
     ):
         self.tools = tools
         self.ollama_base_url = ollama_base_url
         self.agent_model = agent_model
         self.llm_model = llm_model
         self.reranker_model = reranker_model
+        # The merged set concentrates cross-folder BM25 noise, so it gets a
+        # stronger reranker than the per-tool default when configured.
+        self.agent_reranker_model = agent_reranker_model or reranker_model
         self.rerank_top_n = rerank_top_n
         self.turbovec_persist_path = turbovec_persist_path
         self.last_tools_used: list[str] = []
         self.last_pre_rerank_sources: list[str] = []
+        self.last_pre_rerank_chunks: list[dict] = []
 
     def _route(self, question: str) -> list[str]:
         """Ask the LLM which tool(s) to use; return an ordered list of names."""
         import ollama
         from ctcobot.prompt_templates import AGENT_SYSTEM_PROMPT, AGENT_TOOLS
 
-        client = ollama.Client(host=self.ollama_base_url)
+        client = ollama.Client(host=self.ollama_base_url, timeout=ROUTE_TIMEOUT_SECONDS)
         messages = [
             {"role": "system", "content": AGENT_SYSTEM_PROMPT},
             {"role": "user", "content": question},
@@ -138,32 +146,39 @@ class QueryAgent:
             chosen = routed or list(self.tools)[:1]
         logger.info("Agent routing chose: %s | %s", chosen, question[:60])
 
-        # 5. Execute tools, sharing the folder ranking.
+        # 5. Execute tools, sharing the folder ranking. Collect the deduped
+        #    pre-rerank candidate set (by source+chunk) for clean retrieval
+        #    metrics, plus the merged chunks for answer synthesis.
         merged: dict[tuple, dict] = {}
-        pre_rerank_sources: list[str] = []
+        pre_rerank_chunks: dict[tuple, dict] = {}
         for name in chosen:
             tool = self.tools[name]
             chunks = tool(question, ranked_folders=ranked_folders)
-            pre_rerank_sources.extend(getattr(tool, "last_pre_rerank_sources", []))
+            for c in getattr(tool, "last_pre_rerank_chunks", []):
+                pre_rerank_chunks.setdefault((c["source_path"], c["chunk_index"]), c)
             for c in chunks:
                 key = (c["source_path"], c["chunk_index"])
                 if key not in merged or c["score"] > merged[key]["score"]:
                     merged[key] = c
 
+        deduped_pre_rerank = list(pre_rerank_chunks.values())
         self.last_tools_used = chosen
-        self.last_pre_rerank_sources = pre_rerank_sources
+        self.last_pre_rerank_chunks = deduped_pre_rerank
+        self.last_pre_rerank_sources = [c["source_path"] for c in deduped_pre_rerank]
 
         candidates = list(merged.values())
         if not candidates:
             logger.warning("Agent retrieved no chunks for: %s", question[:60])
 
-        # 6. Rerank the merged candidate set and synthesize the answer.
+        # 6. Rerank the merged candidate set (stronger reranker — this is where
+        #    cross-folder BM25 noise concentrates) and synthesize the answer.
         reranked = rerank_chunks(
-            candidates, question, self.reranker_model,
+            candidates, question, self.agent_reranker_model,
             self.rerank_top_n, self.ollama_base_url,
         )
         prompt_data = build_prompt(question, reranked)
         result = generate_answer(prompt_data, self.ollama_base_url, self.llm_model)
         result["tools_used"] = chosen
-        result["pre_rerank_sources"] = pre_rerank_sources
+        result["pre_rerank_sources"] = self.last_pre_rerank_sources
+        result["pre_rerank_chunks"] = deduped_pre_rerank
         return result

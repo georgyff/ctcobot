@@ -27,6 +27,7 @@ def create_pipeline(**kwargs) -> Pipeline:
                 "params:agent_model",
                 "params:bm25_top_k",
                 "params:priority_folders",
+                "params:agent_reranker_model",
             ],
             outputs="qa_eval_results",
             name="run_eval_pipeline_node",
@@ -36,7 +37,7 @@ def create_pipeline(**kwargs) -> Pipeline:
             inputs=[
                 "qa_eval_results",
                 "params:turbovec_persist_path",
-                "params:top_k",
+                "params:retrieval_eval_k",
             ],
             outputs="retrieval_results",
             name="compute_retrieval_metrics_node",

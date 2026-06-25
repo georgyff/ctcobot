@@ -23,6 +23,12 @@ rerank_top_n: 6          # 5 (v4.4) → 8 (v4.5 — too many, confused answer LL
 # ── Agentic routing (v5.0) ────────────────────────────────────────────────────
 agent_model: "qwen3.5:4b"   # tool-calling router that picks vector_rag / keyword_rag
 bm25_top_k: 10              # BM25 candidates returned before merge + rerank
+agent_reranker_model: "qwen3.5:4b"   # stronger reranker for the merged set (v5.2);
+                                     # the merged union concentrates cross-folder
+                                     # BM25 noise, so it gets 4b not 0.8b
+
+# ── Retrieval evaluation (v5.2) ───────────────────────────────────────────────
+retrieval_eval_k: 10        # fixed top-k window for hit/MRR/precision/recall
 
 # ── Models ────────────────────────────────────────────────────────────────────
 embedding_model: "nomic-embed-text"

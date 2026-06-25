@@ -32,6 +32,7 @@ def run_eval_pipeline(
     agent_model: str,
     bm25_top_k: int,
     priority_folders: list[str],
+    agent_reranker_model: str,
 ) -> list[dict]:
     """
     Run the agentic RAG pipeline once per QA pair.
@@ -71,6 +72,7 @@ def run_eval_pipeline(
         reranker_model=reranker_model,
         rerank_top_n=rerank_top_n,
         turbovec_persist_path=turbovec_persist_path,
+        agent_reranker_model=agent_reranker_model,
     )
 
     results = []
@@ -92,6 +94,7 @@ def run_eval_pipeline(
                 "expected_source": row["source_file"],
                 "expected_answer": row["expected_answer"],
                 "pre_rerank_sources": result["pre_rerank_sources"],
+                "pre_rerank_chunks": result.get("pre_rerank_chunks", []),
                 "answer": result["answer"],
                 "sources": result["sources"],
                 "tools_used": result["tools_used"],
@@ -106,6 +109,7 @@ def run_eval_pipeline(
                 "expected_source": row["source_file"],
                 "expected_answer": row["expected_answer"],
                 "pre_rerank_sources": [],
+                "pre_rerank_chunks": [],
                 "answer": "ERROR",
                 "sources": [],
                 "tools_used": [],
@@ -117,13 +121,31 @@ def run_eval_pipeline(
     return results
 
 
+_NO_RETRIEVAL_TARGET = {"", "-", "none", "n/a", "na"}
+
+
+def _source_matches(retrieved: str, expected: str) -> bool:
+    """True if a retrieved source path refers to the expected source doc."""
+    return retrieved.endswith(expected) or expected in retrieved
+
+
 def compute_retrieval_metrics(
     qa_eval_results: list[dict],
     turbovec_persist_path: str,
-    top_k: int,
+    retrieval_eval_k: int,
 ) -> dict:
     """
-    Compute retrieval metrics (hit rate, MRR, precision, recall) from pre-rerank chunk data.
+    Compute retrieval metrics over a fixed, deduplicated top-k candidate window.
+
+    Candidates come from ``pre_rerank_chunks`` (deduplicated by
+    ``(source_path, chunk_index)`` in the agent), truncated to the first
+    ``retrieval_eval_k`` for every question so precision/recall are comparable
+    regardless of how many tools ran. Recall is bounded by ``min(total_relevant,
+    retrieval_eval_k)`` so it is reachable and never exceeds 1.0.
+
+    Out-of-scope questions (expected_source blank or a no-target sentinel, e.g.
+    the refusal case) are excluded from retrieval aggregates — they are answer-
+    quality cases, not retrieval cases.
     """
     meta_path = Path(turbovec_persist_path) / "meta.json"
     with open(meta_path) as f:
@@ -135,44 +157,72 @@ def compute_retrieval_metrics(
         source_chunk_counts[src] = source_chunk_counts.get(src, 0) + 1
 
     results = []
+    scored = 0           # questions with a real retrieval target
     hits = 0
-    reciprocal_ranks = []
+    reciprocal_ranks: list[float] = []
+    precisions: list[float] = []
+    recalls: list[float] = []
 
     for item in qa_eval_results:
-        expected_source = item["expected_source"]
-        retrieved_sources = item["pre_rerank_sources"]
+        expected_source = (item.get("expected_source") or "").strip()
+
+        # Prefer deduped (source, chunk) candidates; fall back to source list.
+        chunks = item.get("pre_rerank_chunks") or [
+            {"source_path": s, "chunk_index": None}
+            for s in item.get("pre_rerank_sources", [])
+        ]
+        topk = chunks[:retrieval_eval_k]
+        topk_sources = [c["source_path"] for c in topk]
+
+        if expected_source.lower() in _NO_RETRIEVAL_TARGET:
+            results.append({
+                "question": item["question"],
+                "expected_source": expected_source,
+                "retrieved_sources": topk_sources,
+                "hit": None,
+                "rank": 0,
+                "reciprocal_rank": 0.0,
+                "precision": None,
+                "recall": None,
+                "retrieval_scored": False,
+            })
+            continue
 
         hit = False
         rank = 0
-        for i, src in enumerate(retrieved_sources, start=1):
-            if src.endswith(expected_source) or expected_source in src:
-                hit = True
-                rank = i
+        for i, src in enumerate(topk_sources, start=1):
+            if _source_matches(src, expected_source):
+                hit, rank = True, i
                 break
 
-        retrieved_relevant = sum(
-            1 for src in retrieved_sources
-            if src.endswith(expected_source) or expected_source in src
+        relevant_in_topk = sum(
+            1 for src in topk_sources if _source_matches(src, expected_source)
         )
         total_relevant = sum(
             count for src, count in source_chunk_counts.items()
-            if src.endswith(expected_source) or expected_source in src
+            if _source_matches(src, expected_source)
         )
-        n_retrieved = len(retrieved_sources)
-        precision = retrieved_relevant / n_retrieved if n_retrieved > 0 else 0.0
-        recall = retrieved_relevant / total_relevant if total_relevant > 0 else 0.0
+        k = len(topk) if topk else 1
+        precision = relevant_in_topk / k
+        recall_denom = min(total_relevant, retrieval_eval_k) or 1
+        recall = relevant_in_topk / recall_denom
 
+        scored += 1
         hits += int(hit)
-        reciprocal_ranks.append(1.0 / rank if rank > 0 else 0.0)
+        rr = 1.0 / rank if rank > 0 else 0.0
+        reciprocal_ranks.append(rr)
+        precisions.append(precision)
+        recalls.append(recall)
         results.append({
             "question": item["question"],
             "expected_source": expected_source,
-            "retrieved_sources": retrieved_sources,
+            "retrieved_sources": topk_sources,
             "hit": hit,
             "rank": rank,
-            "reciprocal_rank": 1.0 / rank if rank > 0 else 0.0,
+            "reciprocal_rank": rr,
             "precision": round(precision, 4),
             "recall": round(recall, 4),
+            "retrieval_scored": True,
         })
         logger.info(
             "%s Rank=%s | %s",
@@ -181,15 +231,14 @@ def compute_retrieval_metrics(
             item["question"][:60],
         )
 
-    n = len(results)
-    hit_rate = hits / n if n > 0 else 0.0
-    mrr = sum(reciprocal_ranks) / n if n > 0 else 0.0
-    avg_precision = sum(r["precision"] for r in results) / n if n > 0 else 0.0
-    avg_recall = sum(r["recall"] for r in results) / n if n > 0 else 0.0
+    hit_rate = hits / scored if scored else 0.0
+    mrr = sum(reciprocal_ranks) / scored if scored else 0.0
+    avg_precision = sum(precisions) / scored if scored else 0.0
+    avg_recall = sum(recalls) / scored if scored else 0.0
 
     logger.info(
-        "Retrieval metrics: Hit Rate=%.3f | MRR=%.3f | P=%.3f | R=%.3f",
-        hit_rate, mrr, avg_precision, avg_recall,
+        "Retrieval metrics @k=%d (n=%d): Hit Rate=%.3f | MRR=%.3f | P=%.3f | R=%.3f",
+        retrieval_eval_k, scored, hit_rate, mrr, avg_precision, avg_recall,
     )
 
     return {
@@ -198,8 +247,8 @@ def compute_retrieval_metrics(
         "avg_precision": round(avg_precision, 4),
         "avg_recall": round(avg_recall, 4),
         "hits": hits,
-        "total": n,
-        "top_k": top_k,
+        "total": scored,
+        "retrieval_eval_k": retrieval_eval_k,
         "details": results,
     }
 
@@ -249,6 +298,9 @@ def compute_quality_metrics(
                     {"role": "user", "content": judge_user_prompt},
                 ],
                 think=False,
+                # Deterministic scoring — same answer gets the same score,
+                # the single biggest lever for benchmark reproducibility.
+                options={"temperature": 0.0},
             )
             raw = judge_response["message"]["content"].strip()
 
@@ -370,10 +422,10 @@ def save_benchmark_report(
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "5.1",
+        "benchmark_version": "5.4",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
-            "hit_rate_at_5": 0.70,
+            "hit_rate_at_k": 0.70,
             "mrr": 0.55,
             "precision_at_k": 0.15,
             "recall_at_k": 0.35,
@@ -382,13 +434,13 @@ def save_benchmark_report(
         },
         "results": {
             "retrieval": {
-                "hit_rate_at_5": retrieval_results["hit_rate"],
+                "hit_rate_at_k": retrieval_results["hit_rate"],
                 "mrr": retrieval_results["mrr"],
                 "avg_precision": retrieval_results["avg_precision"],
                 "avg_recall": retrieval_results["avg_recall"],
                 "hits": retrieval_results["hits"],
                 "total": retrieval_results["total"],
-                "top_k": retrieval_results["top_k"],
+                "retrieval_eval_k": retrieval_results["retrieval_eval_k"],
                 "hit_rate_pass": retrieval_results["hit_rate"] >= 0.70,
                 "mrr_pass": retrieval_results["mrr"] >= 0.55,
                 "precision_pass": retrieval_results["avg_precision"] >= 0.15,
@@ -419,19 +471,19 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v5-1.json")
+    report_path = Path("data/08_reporting/benchmark_report_v5-4.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v5.1")
+    print("  ctcobot BENCHMARK REPORT v5.4")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")
     print(
         f"  {'Hit Rate @ k':<30} "
-        f"{r['retrieval']['hit_rate_at_5']:>8.3f}  "
+        f"{r['retrieval']['hit_rate_at_k']:>8.3f}  "
         f"{'≥ 0.700':>8}  "
         f"{'✅' if r['retrieval']['hit_rate_pass'] else '❌':>6}"
     )

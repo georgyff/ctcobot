@@ -102,6 +102,7 @@ class KeywordRAGTool:
         self.top_folders = top_folders
         self.priority_folders = list(priority_folders or [])
         self.last_pre_rerank_sources: list[str] = []
+        self.last_pre_rerank_chunks: list[dict] = []
 
     def __call__(self, query: str, ranked_folders: list[str] | None = None) -> list[dict]:
         import numpy as np
@@ -118,6 +119,7 @@ class KeywordRAGTool:
         if not query_tokens:
             logger.warning("BM25 query had no tokens after filtering: %s", query[:60])
             self.last_pre_rerank_sources = []
+            self.last_pre_rerank_chunks = []
             return []
 
         scores = bm25.get_scores(query_tokens)
@@ -156,6 +158,10 @@ class KeywordRAGTool:
         ]
 
         self.last_pre_rerank_sources = [c["source_path"] for c in chunks]
+        self.last_pre_rerank_chunks = [
+            {"source_path": c["source_path"], "chunk_index": c["chunk_index"]}
+            for c in chunks
+        ]
         logger.info(
             "BM25 retrieved %d chunks. Priority folders: %s. Top score: %s",
             len(chunks), list(priority_set),
@@ -202,6 +208,7 @@ class VectorRAGTool:
         self.retrieve_oversample = retrieve_oversample
         self.priority_folders = list(priority_folders or [])
         self.last_pre_rerank_sources: list[str] = []
+        self.last_pre_rerank_chunks: list[dict] = []
         self.last_ranked_folders: list[str] = []
 
     def __call__(self, query: str, ranked_folders: list[str] | None = None) -> list[dict]:
@@ -229,6 +236,10 @@ class VectorRAGTool:
             self.priority_folders,
         )
         self.last_pre_rerank_sources = [c["source_path"] for c in raw]
+        self.last_pre_rerank_chunks = [
+            {"source_path": c["source_path"], "chunk_index": c["chunk_index"]}
+            for c in raw
+        ]
         return rerank_chunks(
             raw, query, self.reranker_model, self.rerank_top_n, self.ollama_base_url
         )

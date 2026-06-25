@@ -79,6 +79,7 @@ def ask(question: str, top_k: int):
         reranker_model=params["reranker_model"],
         rerank_top_n=params["rerank_top_n"],
         turbovec_persist_path=params["turbovec_persist_path"],
+        agent_reranker_model=params["agent_reranker_model"],
     )
 
     click.echo(f"\nSearching handbook for: {question}\n")
