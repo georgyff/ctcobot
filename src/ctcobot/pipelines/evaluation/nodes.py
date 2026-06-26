@@ -422,7 +422,7 @@ def save_benchmark_report(
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "5.4",
+        "benchmark_version": "GEN",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_k": 0.70,
@@ -471,13 +471,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_v5-4.json")
+    report_path = Path("data/08_reporting/benchmark_report_vGEN.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT v5.4")
+    print("  ctcobot BENCHMARK REPORT vGENERAL")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")
