@@ -18,7 +18,11 @@ retrieve_oversample: 10   # multiplier on top_k for the pre-filter index search
 # ── Reranker ──────────────────────────────────────────────────────────────────
 reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within documents
 rerank_top_n: 6          # 5 (v4.4) → 8 (v4.5 — too many, confused answer LLM)
-                          # → 6 (v4.6 compromise)
+                          # → 6 (v4.6 compromise). Final cut the answer LLM sees.
+vector_rerank_top_n: 10  # GEN.5: vector tool keeps ALL retrieved candidates (≥ top_k)
+                          # so the weak 0.8b reranker no longer pre-drops the
+                          # answer-bearing section; the 4b agent reranker owns the
+                          # final cut to rerank_top_n over the full set.
 
 # ── Agentic routing (v5.0) ────────────────────────────────────────────────────
 agent_model: "qwen3.5:4b"   # tool-calling router that picks vector_rag / keyword_rag
@@ -34,10 +38,29 @@ retrieval_eval_k: 10        # fixed top-k window for hit/MRR/precision/recall
 embedding_model: "nomic-embed-text"
 llm_model: "qwen3.5:4b"
 judge_model: "qwen3.5:4b"
+# GEN.6: judge each answer judge_votes times at judge_temperature and take the
+# MEDIAN score. Multi-vote at moderate temp shrinks the run-to-run judge swing
+# (e.g. the remote-work 1→2→5) that a single greedy temp-0 verdict produced.
+judge_votes: 3
+judge_temperature: 0.4
 ollama_base_url: "http://localhost:11434"
 
 # ── TurboVec index ────────────────────────────────────────────────────────────
 turbovec_persist_path: "data/04_feature/turbovec_db"
+
+# ── Entity-page de-prioritization (GEN.3) ─────────────────────────────────────
+# Retrieval-time penalty on location/entity-specific leaf pages so canonical
+# company-wide policy pages surface on general questions. Generic by default
+# (empty list = no-op); set per-corpus. `_index.md` pages are never penalized.
+deprioritize_path_patterns:
+  - "general-and-entity-benefits/"
+  - "leave-of-absence/"
+  - "france-sas/"   # GEN.7: France entity charter — never a keyed answer, but
+                    # pollutes remote-work & working-hours. (ireland-ltd is NOT
+                    # listed: it IS the keyed answer for right-to-disconnect.)
+entity_penalty_factor: 0.5   # GEN.7: 0.85→0.5. Decisive demotion so location/
+                             # entity leaf pages stop reaching the final answer
+                             # context on general questions.
 
 # ── Corpus ────────────────────────────────────────────────────────────────────
 raw_data_path: "data/01_raw/gitlab_handbook"
@@ -47,11 +70,14 @@ min_doc_tokens: 50       # documents shorter than this are filtered out
 # Latency is derived from per-question timings in run_eval_pipeline; no
 # separate latency loop is run.
 
+# Trimmed in GEN.4: dropped "people-policies" — force-injecting it dragged
+# country/entity leaf pages (leave-of-absence/us.md, france-sas, ireland-ltd)
+# into general questions. The router now adds people-policies only when relevant
+# (working hours / right to disconnect); see FOLDER_RANK_SYSTEM_PROMPT.
 priority_folders:
-  - "legal"
   - "people-group"
   - "total-rewards"
-  - "people-policies"
+  - "legal"
 
 # ── LightRAG ──────────────────────────────────────────────────────────────────
 lightrag_working_dir: "data/04_feature/lightrag_db"

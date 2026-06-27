@@ -94,6 +94,8 @@ class KeywordRAGTool:
         top_k: int,
         top_folders: int,
         priority_folders: list[str] | None = None,
+        deprioritize_path_patterns: list[str] | None = None,
+        entity_penalty_factor: float = 1.0,
     ):
         self.ollama_base_url = ollama_base_url
         self.llm_model = llm_model
@@ -101,6 +103,10 @@ class KeywordRAGTool:
         self.top_k = top_k
         self.top_folders = top_folders
         self.priority_folders = list(priority_folders or [])
+        # GEN.6: same entity-page de-prioritization the vector path uses, so
+        # location/entity leaf pages don't leak into the merged set via BM25.
+        self.deprioritize_path_patterns = list(deprioritize_path_patterns or [])
+        self.entity_penalty_factor = entity_penalty_factor
         self.last_pre_rerank_sources: list[str] = []
         self.last_pre_rerank_chunks: list[dict] = []
 
@@ -123,6 +129,16 @@ class KeywordRAGTool:
             return []
 
         scores = bm25.get_scores(query_tokens)
+
+        # GEN.6: entity-page de-prioritization (mirrors the vector path). Demote
+        # location/entity leaf pages so they stop crowding general questions; only
+        # touch chunks BM25 actually scored, and never an `_index.md` overview.
+        patterns = self.deprioritize_path_patterns
+        if patterns and self.entity_penalty_factor < 1.0:
+            for i in np.nonzero(scores)[0]:
+                sp = chunk_meta[i]["source_path"]
+                if not sp.endswith("_index.md") and any(p in sp for p in patterns):
+                    scores[i] *= self.entity_penalty_factor
 
         # Folder scoping: keep chunks whose folder is in the top-N ranked
         # folders, always unioned with the HR priority floor so canonical HR
@@ -196,6 +212,9 @@ class VectorRAGTool:
         top_folders: int,
         retrieve_oversample: int,
         priority_folders: list[str] | None = None,
+        deprioritize_path_patterns: list[str] | None = None,
+        entity_penalty_factor: float = 1.0,
+        vector_rerank_top_n: int | None = None,
     ):
         self.ollama_base_url = ollama_base_url
         self.embedding_model = embedding_model
@@ -204,9 +223,15 @@ class VectorRAGTool:
         self.top_k = top_k
         self.reranker_model = reranker_model
         self.rerank_top_n = rerank_top_n
+        # GEN.5: how many chunks the tool keeps after its own (weak) rerank before
+        # handing off to the agent's 4b reranker. Default = top_k (pass-through:
+        # drop nothing, let the 4b reranker own the final selection).
+        self.vector_rerank_top_n = vector_rerank_top_n or top_k
         self.top_folders = top_folders
         self.retrieve_oversample = retrieve_oversample
         self.priority_folders = list(priority_folders or [])
+        self.deprioritize_path_patterns = list(deprioritize_path_patterns or [])
+        self.entity_penalty_factor = entity_penalty_factor
         self.last_pre_rerank_sources: list[str] = []
         self.last_pre_rerank_chunks: list[dict] = []
         self.last_ranked_folders: list[str] = []
@@ -234,6 +259,8 @@ class VectorRAGTool:
             self.top_folders,
             self.retrieve_oversample,
             self.priority_folders,
+            self.deprioritize_path_patterns,
+            self.entity_penalty_factor,
         )
         self.last_pre_rerank_sources = [c["source_path"] for c in raw]
         self.last_pre_rerank_chunks = [
@@ -241,5 +268,6 @@ class VectorRAGTool:
             for c in raw
         ]
         return rerank_chunks(
-            raw, query, self.reranker_model, self.rerank_top_n, self.ollama_base_url
+            raw, query, self.reranker_model, self.vector_rerank_top_n,
+            self.ollama_base_url,
         )

@@ -59,6 +59,19 @@ You will be given a question and a set of excerpts from the company handbook.
   documented. Do not refuse to answer about an existing policy schedule
   just because new instances are no longer being created.
 
+## Prefer the general company-wide policy over location-specific variants
+- When the excerpts contain BOTH a general, company-wide policy and
+  country-, entity-, or location-specific variants, and the question does
+  not name a specific country or entity, lead with the **general
+  company-wide policy**. Note in a single sentence that regional or
+  entity-specific details vary — do NOT enumerate each country's rules.
+- Give country- or entity-specific detail only when the question names that
+  location, or when no general policy is present in the excerpts.
+- NEVER present a single country's number or an external statutory limit (e.g.
+  "20 vacation days", a national "48-hour limit") as if it were the company's
+  policy. If the company's policy is that something is flexible, has no set
+  number, or is the team member's own decision, state THAT as the answer.
+
 ## Lead with the direct answer
 - Open with the specific thing asked — the schedule, the contact, the
   purpose, the named party — in the FIRST sentence. State it plainly
@@ -127,8 +140,11 @@ FOLDER_RANK_SYSTEM_PROMPT = (
     "likely to contain the answer, ordered from most to least relevant. "
     "Use folder names literally: compensation/equity questions → "
     "'total-rewards'; harassment/EEO/relations → 'people-group' or "
-    "'people-policies'; leave/PTO → 'people-policies'; whistleblowing/"
-    "compliance → 'legal'. "
+    "'people-policies'; leave / PTO / time-off / sick / parental / bereavement / "
+    "jury duty / public holidays → 'people-group' (these live in "
+    "people-group/time-off-and-absence); working hours / working time / right to "
+    "disconnect → 'people-policies'; business travel / expenses / reimbursement / "
+    "spending company money → 'finance'; whistleblowing/compliance → 'legal'. "
     "Performance and talent topics — talent assessment, performance review, "
     "the 9-box / performance-growth-potential matrix, growth potential, TNTR "
     "(Too New To Rate), succession planning, calibration, and 360 feedback — "
@@ -232,11 +248,23 @@ You will be given:
 
 Score the AI assistant's answer on a scale of 1 to 5 using this rubric:
 
-5 - Excellent: Fully correct, complete, and well-grounded. Matches expected answer closely.
+5 - Excellent: Fully correct, complete, and well-grounded. States the SPECIFIC facts, numbers, names, or contacts in the expected answer.
 4 - Good: Mostly correct with minor omissions or slight imprecision.
-3 - Acceptable: Partially correct. Gets the main point but misses important details.
-2 - Poor: Mostly incorrect or incomplete. Contains significant errors or missing key facts.
-1 - Unacceptable: Completely wrong, hallucinated, or refused to answer when an answer exists.
+3 - Acceptable: Partially correct. Gets the general idea but is vague or omits the specific facts/numbers/contacts the expected answer gives.
+2 - Poor: Mostly incorrect or incomplete; OR an honest "I could not find this in the handbook" when the information actually existed (unhelpful, but not harmful).
+1 - Unacceptable: Confidently states an INCORRECT fact, contradicts the policy, or hallucinates (the worst outcome for an HR assistant).
+
+Scoring guidance:
+- Require the expected specifics for a 4 or 5. A generally-correct but vague
+  answer that omits the expected facts/numbers/contacts is at most a 3.
+- When the question asks for the GENERAL company policy, an answer that leads with
+  or centers country-, entity-, or external-statutory rules is a 2-3, even if a
+  correct general fact appears somewhere in it.
+- Honesty over hallucination: a confidently WRONG answer (e.g. a specific number
+  the policy does not set, or a statement that contradicts the policy) is a 1 and
+  must NEVER score higher than an honest "I could not find this" (which is a 2).
+- Judge against the expected answer and the question; do not invent flaws. If a
+  fact the answer states is actually supported, do not call it a hallucination.
 
 Respond with ONLY a JSON object in this exact format, nothing else:
 {"score": <integer 1-5>, "reason": "<one sentence explanation>"}"""

@@ -33,6 +33,9 @@ def run_eval_pipeline(
     bm25_top_k: int,
     priority_folders: list[str],
     agent_reranker_model: str,
+    deprioritize_path_patterns: list[str] | None = None,
+    entity_penalty_factor: float = 1.0,
+    vector_rerank_top_n: int | None = None,
 ) -> list[dict]:
     """
     Run the agentic RAG pipeline once per QA pair.
@@ -55,6 +58,9 @@ def run_eval_pipeline(
         top_folders=top_folders,
         retrieve_oversample=retrieve_oversample,
         priority_folders=priority_folders,
+        deprioritize_path_patterns=deprioritize_path_patterns,
+        entity_penalty_factor=entity_penalty_factor,
+        vector_rerank_top_n=vector_rerank_top_n,
     )
     keyword_tool = KeywordRAGTool(
         ollama_base_url=ollama_base_url,
@@ -63,6 +69,8 @@ def run_eval_pipeline(
         top_k=bm25_top_k,
         top_folders=top_folders,
         priority_folders=priority_folders,
+        deprioritize_path_patterns=deprioritize_path_patterns,
+        entity_penalty_factor=entity_penalty_factor,
     )
     agent = QueryAgent(
         tools={"vector_rag": vector_tool, "keyword_rag": keyword_tool},
@@ -97,6 +105,7 @@ def run_eval_pipeline(
                 "pre_rerank_chunks": result.get("pre_rerank_chunks", []),
                 "answer": result["answer"],
                 "sources": result["sources"],
+                "source_chunks": result.get("source_chunks", []),
                 "tools_used": result["tools_used"],
                 "latency_seconds": round(elapsed, 3),
                 "error": None,
@@ -112,6 +121,7 @@ def run_eval_pipeline(
                 "pre_rerank_chunks": [],
                 "answer": "ERROR",
                 "sources": [],
+                "source_chunks": [],
                 "tools_used": [],
                 "latency_seconds": None,
                 "error": str(e),
@@ -125,8 +135,18 @@ _NO_RETRIEVAL_TARGET = {"", "-", "none", "n/a", "na"}
 
 
 def _source_matches(retrieved: str, expected: str) -> bool:
-    """True if a retrieved source path refers to the expected source doc."""
-    return retrieved.endswith(expected) or expected in retrieved
+    """True if a retrieved path matches the expected source doc.
+
+    ``expected`` may be a ``|``-separated list of acceptable sources — a hit on
+    ANY of them counts. This lets a question whose answer is genuinely
+    answer-equivalent across sibling docs (e.g. whistleblowing ↔
+    anti-retaliation) be keyed honestly instead of registering a false miss.
+    """
+    for raw_exp in expected.split("|"):
+        exp = raw_exp.strip()
+        if exp and (retrieved.endswith(exp) or exp in retrieved):
+            return True
+    return False
 
 
 def compute_retrieval_metrics(
@@ -253,10 +273,84 @@ def compute_retrieval_metrics(
     }
 
 
+def _parse_judge_json(raw: str) -> tuple[int, str]:
+    """
+    Parse a judge response into ``(score, reason)``; raise ValueError on failure.
+
+    Robust to code fences and trailing prose: tries the whole string first
+    (``format="json"`` should make it a clean object), then falls back to the
+    outermost ``{...}`` with a **greedy** match (the old non-greedy
+    ``\\{.*?\\}`` truncated at the first inner brace and was the cause of the
+    score-0 "parse error" drops).
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
+
+    candidates = [text]
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        candidates.append(m.group())
+
+    for cand in candidates:
+        try:
+            parsed = json.loads(cand)
+            score = int(parsed["score"])
+            reason = str(parsed.get("reason", ""))
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            continue
+        if 1 <= score <= 5:
+            return score, reason
+
+    # Salvage: JSON truncated (e.g. num_predict cut the reason mid-string) or
+    # malformed — pull the score digit directly. This catches the residual
+    # refusal-case parse failures that survived format="json".
+    salvage = re.search(r'"?score"?\s*[:=]\s*"?([1-5])"?', text)
+    if salvage:
+        return int(salvage.group(1)), reason_from_text(text)
+    raise ValueError(f"unparseable judge response: {raw[:120]!r}")
+
+
+def reason_from_text(text: str) -> str:
+    """Best-effort pull of the judge's reason string from malformed JSON.
+
+    The score is recovered separately and reliably (it precedes ``reason`` in
+    the JSON); this only restores the human-readable reason. Tries the well-
+    formed ``"reason": "..."`` first, then a lenient grab of everything after
+    the ``reason`` key (tolerating embedded quotes/newlines and a truncated
+    tail), stripping any trailing JSON punctuation.
+    """
+    m = re.search(r'"reason"\s*[:=]\s*"([^"]*)"', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'"reason"\s*[:=]\s*"?(.+)', text, re.DOTALL)
+    if m:
+        return m.group(1).strip().rstrip('"}').replace("\n", " ").strip()
+    return "reason unavailable (judge JSON truncated; score recovered)"
+
+
+def _aggregate_votes(votes: list[tuple[int, str]]) -> tuple[int, str]:
+    """Median score across judge votes; reason from a median-scoring vote.
+
+    GEN.6: median (not mean) is robust to a single lenient/harsh outlier — the
+    fix for the run-to-run judge swing (e.g. remote-work scoring 1→2→5). Returns
+    (0, ...) only if every vote failed to parse.
+    """
+    valid = [(s, r) for s, r in votes if 1 <= s <= 5]
+    if not valid:
+        return 0, "all judge votes failed to parse"
+    sorted_scores = sorted(s for s, _ in valid)
+    median = sorted_scores[len(sorted_scores) // 2]
+    reason = next(r for s, r in valid if s == median)
+    return median, reason
+
+
 def compute_quality_metrics(
     qa_eval_results: list[dict],
     ollama_base_url: str,
     judge_model: str,
+    judge_votes: int = 3,
+    judge_temperature: float = 0.4,
 ) -> dict:
     """
     Score answer quality using an LLM judge on pre-generated answers.
@@ -288,34 +382,30 @@ def compute_quality_metrics(
             actual_answer=actual_answer,
         )
 
-        score = None
-        reason = "parse error"
-        try:
-            judge_response = ollama_client.chat(
-                model=judge_model,
-                messages=[
-                    {"role": "system", "content": JUDGE_PROMPT},
-                    {"role": "user", "content": judge_user_prompt},
-                ],
-                think=False,
-                # Deterministic scoring — same answer gets the same score,
-                # the single biggest lever for benchmark reproducibility.
-                options={"temperature": 0.0},
-            )
-            raw = judge_response["message"]["content"].strip()
+        # GEN.6: sample judge_votes independent verdicts at a moderate
+        # temperature and take the MEDIAN. Multi-vote shrinks the judge's
+        # per-answer variance (a single greedy temp-0 verdict just committed to
+        # one borderline token path, and identical temp-0 retries never recovered
+        # a parse failure).
+        votes: list[tuple[int, str]] = []
+        for _ in range(max(1, judge_votes)):
+            try:
+                judge_response = ollama_client.chat(
+                    model=judge_model,
+                    messages=[
+                        {"role": "system", "content": JUDGE_PROMPT},
+                        {"role": "user", "content": judge_user_prompt},
+                    ],
+                    think=False,
+                    format="json",
+                    options={"temperature": judge_temperature, "num_predict": 768},
+                )
+                raw = judge_response["message"]["content"].strip()
+                votes.append(_parse_judge_json(raw))
+            except Exception as e:
+                logger.warning("Judge vote failed for: %s — %s", question[:50], e)
 
-            match = re.search(r'\{.*?\}', raw, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group())
-                score = int(parsed["score"])
-                reason = parsed.get("reason", "")
-            else:
-                logger.warning("Could not parse judge response: %s", raw[:100])
-                score = 0
-
-        except Exception as e:
-            logger.warning("Judge failed for question: %s — %s", question[:50], e)
-            score = 0
+        score, reason = _aggregate_votes(votes)
 
         scores.append(score)
         results.append({
@@ -323,6 +413,7 @@ def compute_quality_metrics(
             "expected_answer": expected_answer,
             "actual_answer": actual_answer,
             "sources": [s["source_path"] for s in item["sources"]],
+            "source_chunks": item.get("source_chunks", []),
             "tools_used": item.get("tools_used", []),
             "score": score,
             "reason": reason,
@@ -422,7 +513,7 @@ def save_benchmark_report(
     tools_used_distribution = {t: all_tools.count(t) for t in dict.fromkeys(all_tools)}
 
     report = {
-        "benchmark_version": "GEN",
+        "benchmark_version": "GEN.7",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "targets": {
             "hit_rate_at_k": 0.70,
@@ -471,13 +562,13 @@ def save_benchmark_report(
         },
     }
 
-    report_path = Path("data/08_reporting/benchmark_report_vGEN.json")
+    report_path = Path("data/08_reporting/benchmark_report_vGEN-7.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
 
     r = report["results"]
     print("\n" + "=" * 60)
-    print("  ctcobot BENCHMARK REPORT vGENERAL")
+    print("  ctcobot BENCHMARK REPORT vGEN.7")
     print("=" * 60)
     print(f"  {'Metric':<30} {'Result':>8}  {'Target':>8}  {'Pass':>6}")
     print(f"  {'-'*30} {'-'*8}  {'-'*8}  {'-'*6}")

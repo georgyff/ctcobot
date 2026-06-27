@@ -40,7 +40,7 @@ prompt_data:
 # ══════════════════════════════════════════════════════════════════════════════
 eval_qa_pairs:
   type: pandas.CSVDataset
-  filepath: data/05_model_input/eval_qa_pairs_general.csv
+  filepath: data/05_model_input/eval_qa_pairs_fixes.csv
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 07_model_output — query results

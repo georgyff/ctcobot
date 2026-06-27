@@ -62,6 +62,9 @@ def ask(question: str, top_k: int):
         top_folders=params["top_folders"],
         retrieve_oversample=params["retrieve_oversample"],
         priority_folders=params["priority_folders"],
+        deprioritize_path_patterns=params.get("deprioritize_path_patterns"),
+        entity_penalty_factor=params.get("entity_penalty_factor", 1.0),
+        vector_rerank_top_n=params.get("vector_rerank_top_n"),
     )
     keyword_tool = KeywordRAGTool(
         ollama_base_url=params["ollama_base_url"],
@@ -70,6 +73,8 @@ def ask(question: str, top_k: int):
         top_k=params["bm25_top_k"],
         top_folders=params["top_folders"],
         priority_folders=params["priority_folders"],
+        deprioritize_path_patterns=params.get("deprioritize_path_patterns"),
+        entity_penalty_factor=params.get("entity_penalty_factor", 1.0),
     )
     agent = QueryAgent(
         tools={"vector_rag": vector_tool, "keyword_rag": keyword_tool},

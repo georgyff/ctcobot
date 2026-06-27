@@ -298,6 +298,8 @@ def retrieve_chunks_folder_priority(
     top_folders: int,
     retrieve_oversample: int,
     priority_folders: list[str] | None = None,
+    deprioritize_path_patterns: list[str] | None = None,
+    entity_penalty_factor: float = 1.0,
 ) -> list[dict]:
     """
     Retrieve chunks restricted to the top-N ranked folders.
@@ -320,6 +322,12 @@ def retrieve_chunks_folder_priority(
         top_folders:           Number of top-ranked folders to keep.
         retrieve_oversample:   Multiplier on top_k for the index pre-search.
         priority_folders:      Folders always included in the filter set.
+        deprioritize_path_patterns: Substrings; chunks whose source_path matches
+                               one (and is not an ``_index.md``) have their score
+                               multiplied by ``entity_penalty_factor`` so
+                               location/entity leaf pages stop crowding out the
+                               canonical company-wide pages on general questions.
+        entity_penalty_factor: Score multiplier (<1.0) for matched chunks.
 
     Returns:
         List of chunk dicts with keys: text, source_path, folder,
@@ -357,6 +365,19 @@ def retrieve_chunks_folder_priority(
         }
         for s, i in zip(scores[0], indices[0])
     ]
+
+    # Entity-page de-prioritization: demote location/entity leaf pages (e.g.
+    # per-country benefit pages) so the canonical company-wide policy page
+    # surfaces on general questions. `_index.md` overview pages are never
+    # penalized. Applied to the oversampled pool, then re-sort so the boost
+    # takes effect before the folder filter + top_k truncation below.
+    patterns = deprioritize_path_patterns or []
+    if patterns and entity_penalty_factor < 1.0:
+        for c in all_hits:
+            sp = c["source_path"]
+            if not sp.endswith("_index.md") and any(p in sp for p in patterns):
+                c["score"] = round(c["score"] * entity_penalty_factor, 4)
+        all_hits.sort(key=lambda c: c["score"], reverse=True)
 
     if skip_filter:
         chunks = all_hits[:top_k]
@@ -499,6 +520,13 @@ RERANK_PROMPT = (
     "actual fact, definition, procedure, or contact information being asked "
     "for. Demote excerpts that only mention the topic in passing or that "
     "describe a related but different policy. "
+    "When the question does NOT name a specific country, entity, or location, "
+    "PREFER excerpts that state the general, company-wide policy and DEMOTE "
+    "excerpts that give a single country's/entity's specific rule or an external "
+    "statutory law (e.g. one country's vacation-day count, or a national "
+    "working-time limit). A general company policy that happens to contain a "
+    "number (e.g. '25 paid sick days', '16 weeks parental leave') is NOT "
+    "location-specific — keep it. "
     "Do not bias toward chunks with more numbers or longer text; "
     "judge each chunk by whether its content answers THIS question. "
     "Include every excerpt number exactly once. "
@@ -668,10 +696,25 @@ def generate_answer(
                 "score": chunk.get("rerank_score", chunk["score"]),
             })
 
+    # GEN.5 diagnostics: per-chunk view of what the answer model actually saw
+    # (NOT source_path-deduped), so we can see which SECTION of a multi-topic doc
+    # reached the model — the blind spot behind the right-doc/wrong-section
+    # refusals (e.g. time-off-types.md retrieved but the "25 paid sick days"
+    # chunk absent from the final set).
+    source_chunks = [
+        {
+            "source_path": chunk["source_path"],
+            "chunk_index": chunk.get("chunk_index"),
+            "snippet": chunk.get("text", "")[:160],
+        }
+        for chunk in prompt_data["chunks"]
+    ]
+
     result = {
         "question": prompt_data["question"],
         "answer": answer,
         "sources": sources,
+        "source_chunks": source_chunks,
         "model": llm_model,
     }
 
