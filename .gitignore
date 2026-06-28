@@ -1,6 +1,12 @@
 ##########################
 # KEDRO PROJECT
 
+# local benchmark log / Claude report-writing guide (not version-controlled)
+CLAUDE.md
+
+# local portfolio notes (not version-controlled)
+portoflio.md
+
 # ignore all local configuration
 conf/local/**
 !conf/local/.gitkeep

@@ -10,6 +10,8 @@ seaborn~=0.12.1
 # RAG core
 chromadb>=0.5.0
 tiktoken>=0.7.0
+ollama>=0.5.0          # Ollama Python client (chat/embeddings; uses the think= param)
+turbovec>=0.7.0        # quantized vector index (writes index.tq + meta.json)
 
 # Document processing
 python-frontmatter>=1.1.0

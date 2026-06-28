@@ -64,6 +64,8 @@ def create_pipeline(**kwargs) -> Pipeline:
                 "retrieval_results",
                 "quality_results",
                 "latency_results",
+                "params:benchmark_version",
+                "params:benchmark_targets",
             ],
             outputs="benchmark_report",
             name="save_benchmark_report_node",

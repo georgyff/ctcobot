@@ -1,61 +1,73 @@
 # ── Runtime (overridden at query time via CLI) ─────────────────────────────────
-question: "What is the company PTO policy?"
+question: "What is the company PTO policy?"   # default question for the ad-hoc query pipeline
+
+# ── Benchmark versioning ───────────────────────────────────────────────────────
+# Single source of truth for the version label. Change it once per run; it drives
+# the report's benchmark_version field, the output filename
+# (data/08_reporting/benchmark_report_v<version>.json, dots → dashes) and the
+# console banner.
+benchmark_version: "FINAL"
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
-chunk_size: 256          # tokens per chunk
-chunk_overlap: 50        # token overlap between consecutive chunks
-encoding_name: "cl100k_base"   # tiktoken encoding (matches gpt-4o-mini & embeddings)
+chunk_size: 256                # tokens per chunk
+chunk_overlap: 50              # token overlap between consecutive chunks
+encoding_name: "cl100k_base"   # tiktoken encoding used to count tokens when chunking
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
-top_k: 10                 # reverted from 20 in v4.6 — folder filter keeps the
-                          # pool clean; 20 added noise without quality gain
+top_k: 10                 # vector chunks the vector tool returns per query (before rerank)
 
 # ── Folder routing ────────────────────────────────────────────────────────────
-top_folders: 7            # widened from 5 → 7 in v4.6 to give headroom against
-                          # folder mis-routing (v4.5 missed people-group on 3 queries)
-retrieve_oversample: 10   # multiplier on top_k for the pre-filter index search
+top_folders: 5            # number of LLM-ranked folders retrieval is restricted to
+retrieve_oversample: 10   # index pre-search multiplier: fetch top_k × this, then folder-filter back to top_k
 
 # ── Reranker ──────────────────────────────────────────────────────────────────
-reranker_model: "qwen3.5:0.8b"   # reverted from 4b; 4b over-selects within documents
-rerank_top_n: 6          # 5 (v4.4) → 8 (v4.5 — too many, confused answer LLM)
-                          # → 6 (v4.6 compromise)
+reranker_model: "qwen3.5:4b"   # model that reranks each tool's own results
+rerank_top_n: 6                  # chunks kept after rerank — the final answer-LLM context
 
-# ── Agentic routing (v5.0) ────────────────────────────────────────────────────
-agent_model: "qwen3.5:4b"   # tool-calling router that picks vector_rag / keyword_rag
-bm25_top_k: 10              # BM25 candidates returned before merge + rerank
-agent_reranker_model: "qwen3.5:4b"   # stronger reranker for the merged set (v5.2);
-                                     # the merged union concentrates cross-folder
-                                     # BM25 noise, so it gets 4b not 0.8b
+# ── Agentic routing ───────────────────────────────────────────────────────────
+agent_model: "qwen3.5:4b"            # tool-calling router that picks vector_rag / keyword_rag
+bm25_top_k: 10                       # keyword (BM25) candidates returned before merge + rerank
+agent_reranker_model: "qwen3.5:4b"   # model that reranks the merged vector + keyword set
 
-# ── Retrieval evaluation (v5.2) ───────────────────────────────────────────────
-retrieval_eval_k: 10        # fixed top-k window for hit/MRR/precision/recall
+# ── Retrieval evaluation ──────────────────────────────────────────────────────
+retrieval_eval_k: 10      # fixed top-k window the retrieval metrics (hit/MRR/precision/recall) score over
 
 # ── Models ────────────────────────────────────────────────────────────────────
-embedding_model: "nomic-embed-text"
-llm_model: "qwen3.5:4b"
-judge_model: "qwen3.5:4b"
-ollama_base_url: "http://localhost:11434"
+embedding_model: "nomic-embed-text"        # Ollama model that embeds chunks and queries
+llm_model: "qwen3.5:4b"                    # Ollama model that writes the final answer
+judge_model: "qwen3.5:4b"                  # Ollama model that scores answer quality in evaluation
+ollama_base_url: "http://localhost:11434"  # Ollama server URL
 
 # ── TurboVec index ────────────────────────────────────────────────────────────
-turbovec_persist_path: "data/04_feature/turbovec_db"
+turbovec_persist_path: "data/04_feature/turbovec_db"   # directory holding index.tq + meta.json
 
 # ── Corpus ────────────────────────────────────────────────────────────────────
-raw_data_path: "data/01_raw/gitlab_handbook"
-min_doc_tokens: 50       # documents shorter than this are filtered out
+raw_data_path: "data/01_raw/gitlab_handbook"   # root of the Markdown corpus to ingest
+min_doc_tokens: 50                             # drop documents shorter than this many tokens
 
-# ── Evaluation ────────────────────────────────────────────────────────────────
-# Latency is derived from per-question timings in run_eval_pipeline; no
-# separate latency loop is run.
+# ── Evaluation: acceptance criteria ───────────────────────────────────────────
+# Pass/fail thresholds for the benchmark report; retrieval/quality metrics are
+# lower bounds (≥) and p95 latency is an upper bound (≤). They set the report's
+# `targets` block and every `*_pass` flag.
+benchmark_targets:
+  hit_rate_at_k: 0.70        # min fraction of questions whose correct doc is in the top-k
+  mrr: 0.55                  # min mean reciprocal rank of the correct doc
+  precision_at_k: 0.15       # min average precision over the top-k window
+  recall_at_k: 0.35          # min average recall over the top-k window
+  avg_quality_score: 3.5     # min mean LLM-judge answer score (1–5)
+  p95_latency_seconds: 5.0   # max p95 end-to-end latency per question (seconds)
 
+# Folders ALWAYS unioned into the retrieval filter (a safety floor so HR/policy
+# folders survive router variance); leave empty for no floor.
 priority_folders:
   - "legal"
   - "people-group"
   - "total-rewards"
   - "people-policies"
 
-# ── LightRAG ──────────────────────────────────────────────────────────────────
-lightrag_working_dir: "data/04_feature/lightrag_db"
-lightrag_index_folders:         # only these handbook folders are graph-indexed
+# ── LightRAG (optional knowledge-graph index, currently not working) ─────────────────────────────────
+lightrag_working_dir: "data/04_feature/lightrag_db"   # directory for the LightRAG graph store
+lightrag_index_folders:                               # only these top-level folders are graph-indexed
   - people-policies
   - people-group
   - hiring

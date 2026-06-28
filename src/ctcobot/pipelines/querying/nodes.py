@@ -207,12 +207,13 @@ def rank_folders(
     Use the LLM to rank handbook folders by likelihood of containing the answer.
 
     Uses Ollama's ``format="json"`` to constrain output to a valid JSON object
-    of shape ``{"ranked": ["folder1", ...]}``. On any failure (parse error,
-    timeout, hang, empty list) returns an **empty list** as a signal that the
-    folder filter should be skipped — ``retrieve_chunks_folder_priority`` then
-    falls back to plain top-k retrieval over the full index. This avoids the
-    earlier bug where a parse failure silently restricted retrieval to the
-    alphabetical first five folders (``about``, ``acquisitions``, ...).
+    of shape ``{"ranked": ["folder1", ...]}``. Returns ONLY the folders the LLM
+    actually picked (recognized names, in LLM order) — it does NOT pad the list,
+    so a precise 1-2 folder answer stays 1-2 folders and never pulls in the
+    alphabetical-head folders (``about``, ``acquisitions``, ...). On any failure
+    (parse error, timeout, hang, no recognized names) returns an **empty list**
+    as a signal to skip the folder filter — ``retrieve_chunks_folder_priority``
+    then falls back to plain top-k retrieval over the full index.
 
     Args:
         question:              The original user question.
@@ -280,13 +281,12 @@ def rank_folders(
         )
         return []
 
-    # Pad with any folders the LLM omitted so downstream priority slicing is
-    # stable regardless of how many names the LLM emitted.
-    for f in folders:
-        if f not in seen:
-            ordered.append(f)
-
-    logger.info("Folder ranking (top 5): %s", ordered[:5])
+    # Return ONLY the folders the LLM actually picked — no alphabetical padding.
+    # Padding to a fixed length used to inject the alphabetical-head folders
+    # (about, acquisitions, ...) into the top-N filter whenever the LLM returned
+    # fewer than top_folders names. Downstream slices `[:top_folders]` (a short
+    # list is fine) and the priority_folders floor still guarantees HR coverage.
+    logger.info("Folder ranking: %s", ordered)
     return ordered
 
 
