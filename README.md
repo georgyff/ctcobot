@@ -23,7 +23,6 @@ reranking and answer synthesis) on top of [Ollama](https://ollama.com)
 ```bash
 ollama pull nomic-embed-text     # embeddings
 ollama pull qwen3.5:4b           # answer LLM / router / reranker / judge
-ollama pull qwen3.5:0.8b         # lightweight per-tool reranker
 ```
 
 Or whichever local models you prefer.
@@ -39,8 +38,8 @@ curl http://localhost:11434/api/version
 ## 2. Install
 
 ```bash
-# from the project root
-pip install -r requirements.txt
+# from the project root — installs the deps AND the `ctcobot` command
+pip install -e .
 # or, with uv:
 uv sync
 ```
@@ -143,7 +142,127 @@ ctcobot evaluate          # writes data/08_reporting/benchmark_report*.json
 Acceptance targets are externalized to parameters.yml
 ---
 
-## 5. Tuning knobs (`conf/base/parameters.yml`)
+## 5. How the pipelines work
+
+The project is built on [Kedro](https://kedro.org). Four pipelines are
+registered in `src/ctcobot/pipeline_registry.py`; the `ctcobot` CLI is a thin
+wrapper that runs them (except `ask`, which drives the agent directly).
+
+| Pipeline | CLI command | Kedro pipeline | What it produces |
+|----------|-------------|----------------|------------------|
+| Indexing | `ctcobot index` | `indexing` | The quantized vector index (`index.tq` + `meta.json`). |
+| Querying (interactive) | `ctcobot ask` | *(agent, not Kedro)* | A grounded answer + sources for one question. |
+| Evaluation | `ctcobot evaluate` | `evaluation` | The benchmark report JSON. |
+| Graph indexing | `ctcobot index_graph` | `lightrag_indexing` | An optional LightRAG knowledge-graph store. |
+
+A standalone linear `querying` Kedro pipeline also exists (see 5.2) but the CLI
+does not use it.
+
+### 5.1 Indexing pipeline (`ctcobot index` → `indexing`)
+
+Turns the Markdown corpus into a searchable, quantized vector index. Four nodes
+run in sequence (`src/ctcobot/pipelines/indexing/nodes.py`):
+
+1. **`ingest_documents`** — recursively reads every `*.md` file under
+   `raw_data_path`. For each file it records the relative path, raw text, the
+   **top-level folder** (used as the routing category), and the filename. Empty
+   or unreadable files are skipped. → `raw_docs`
+2. **`clean_documents`** — strips YAML frontmatter and Hugo shortcodes,
+   collapses excess whitespace, counts tokens with `encoding_name`, and drops
+   documents shorter than `min_doc_tokens`. → `cleaned_docs`
+3. **`chunk_documents`** — splits each cleaned document into `chunk_size`-token
+   chunks with `chunk_overlap` overlap, using LangChain's
+   `RecursiveCharacterTextSplitter` on the tiktoken encoder. → `chunked_docs`
+4. **`embed_and_index`** — embeds every chunk with the Ollama `embedding_model`,
+   L2-normalizes the vectors, builds a 4-bit-quantized `TurboQuantIndex`, and
+   writes `index.tq` (vectors) + `meta.json` (parallel chunk metadata: text,
+   source_path, folder, filename, chunk_index) into `turbovec_persist_path`.
+   A summary lands in `data/07_model_output/indexing_summary.json`.
+
+The same `meta.json` is the single source of chunk text and metadata for **both**
+vector and BM25 retrieval at query time, so the two searches always cover an
+identical set of chunks.
+
+### 5.2 Querying — the agentic RAG path (`ctcobot ask`)
+
+`ctcobot ask` does **not** run a Kedro pipeline. It instantiates a
+`VectorRAGTool`, a `KeywordRAGTool`, and a `QueryAgent`
+(`src/ctcobot/pipelines/querying/{tools,agent}.py`) and answers one question:
+
+1. **Folder ranking** — one LLM call (`rank_folders`) ranks the corpus's
+   top-level folders by relevance to the question. The result is computed once
+   and shared by both tools (no duplicate call). Downstream it is always unioned
+   with the `priority_folders` floor so canonical HR folders survive router
+   variance.
+2. **Routing** — the tool-calling `agent_model` decides whether to also use
+   keyword search. `vector_rag` **always** runs as a semantic floor; the router
+   (plus an acronym / quoted-phrase / hyphenated-term safety net) only decides
+   whether to **also** run `keyword_rag`. This prevents keyword-only misses.
+3. **`vector_rag` (HyDE)** — the LLM writes a hypothetical answer paragraph
+   (HyDE), that paragraph is embedded, and `retrieve_chunks_folder_priority`
+   oversamples `top_k × retrieve_oversample` candidates from the index, filters
+   to the top `top_folders` ranked folders plus the `priority_folders` floor,
+   keeps the top `top_k`, and reranks those with `reranker_model` before
+   returning.
+4. **`keyword_rag` (BM25)** — folder-scoped BM25 over the same chunks (a cached
+   index built from `meta.json`), restricted to the same folder set, returning
+   `bm25_top_k` candidates. Targets exact-term / acronym questions embeddings
+   blur.
+5. **Merge + rerank** — the vector tool returns candidates already reranked by
+   `reranker_model`; the keyword tool returns its BM25 candidates unreranked.
+   The agent merges and deduplicates both by `(source_path, chunk_index)`, then
+   reranks the merged set **again** with `agent_reranker_model` (a listwise LLM
+   rerank) down to `rerank_top_n` chunks.
+6. **Answer** — `generate_answer` calls `llm_model` (temperature 0.2) on the
+   reranked chunks under the grounding `SYSTEM_PROMPT`, returning the answer plus
+   deduplicated source citations.
+
+**Legacy linear `querying` pipeline.** The `querying` Kedro pipeline
+(`pipelines/querying/pipeline.py`) wires the same retrieval nodes — `generate_hyde_doc`
+→ `embed_query` → `rank_folders` → `retrieve_chunks_folder_priority` →
+`rerank_chunks` → `build_prompt` → `generate_answer` — linearly for a single
+`params:question`, with no agent, no BM25, and no merge step. It is runnable with
+`kedro run --pipeline querying` but is **not** used by the CLI; the agentic path
+above superseded it.
+
+### 5.3 Evaluation pipeline (`ctcobot evaluate` → `evaluation`)
+
+Benchmarks the agentic path against the `eval_qa_pairs` CSV. Five nodes
+(`src/ctcobot/pipelines/evaluation/nodes.py`):
+
+1. **`run_eval_pipeline`** — runs the **same `QueryAgent`** (5.2) once per CSV
+   row, recording the answer, sources, tools used, the deduped pre-rerank
+   candidate set (for retrieval metrics), and end-to-end latency. → `qa_eval_results`
+2. **`compute_retrieval_metrics`** — over a fixed, deduplicated top-`retrieval_eval_k`
+   candidate window, computes **hit rate**, **MRR**, **precision**, and
+   **recall** against each row's expected `source_file`. Out-of-corpus rows
+   (blank / `-` / `none` / `n/a`) are excluded so they don't distort retrieval.
+3. **`compute_quality_metrics`** — an LLM judge (`judge_model`, temperature 0,
+   JSON-constrained, with parse-salvage + one retry) scores each answer **1–5**
+   against the expected answer. A correct out-of-corpus refusal is floored to 5
+   (`refusal_floor_applied`); an unparseable judgment scores 0 and is excluded
+   from the average.
+4. **`compute_latency_metrics`** — p50 / p95 / p99 / avg from the per-question
+   timings captured in step 1 (no separate latency loop).
+5. **`save_benchmark_report`** — aggregates everything, applies the
+   `benchmark_targets` thresholds to set each `*_pass` flag, prints the console
+   summary table, and writes
+   `data/08_reporting/benchmark_report_v<benchmark_version>.json` (dots → dashes).
+
+### 5.4 Graph indexing pipeline (`ctcobot index_graph` → `lightrag_indexing`)
+
+**Optional / experimental** — not wired into the answer path. A single node
+`build_lightrag_index` builds a [LightRAG](https://github.com/HKUDS/LightRAG)
+knowledge graph from the `cleaned_docs` produced by the indexing pipeline,
+filtered to `lightrag_index_folders`, using `llm_model` for entity/relationship
+extraction and `embedding_model` for the graph's vector components. The store is
+written to `lightrag_working_dir`. Because it consumes `cleaned_docs`, run
+`ctcobot index` first. It is slow (many LLM calls) and currently informational
+only.
+
+---
+
+## 6. Tuning knobs (`conf/base/parameters.yml`)
 
 | Param | Default | Purpose |
 |-------|---------|---------|
@@ -157,7 +276,7 @@ Acceptance targets are externalized to parameters.yml
 
 ---
 
-## 6. Notes & current limitations
+## 7. Notes & current limitations
 
 - **Interface is the CLI only.** There is no HTTP API or web UI yet — integrate by
   calling `QueryAgent.run()` (see `src/ctcobot/pipelines/querying/agent.py`) or

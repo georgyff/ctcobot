@@ -6,7 +6,7 @@ question: "What is the company PTO policy?"   # default question for the ad-hoc 
 # the report's benchmark_version field, the output filename
 # (data/08_reporting/benchmark_report_v<version>.json, dots → dashes) and the
 # console banner.
-benchmark_version: "FINAL"
+benchmark_version: "FINAL2"
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
 chunk_size: 256                # tokens per chunk
