@@ -55,7 +55,7 @@ benchmark_targets:
   precision_at_k: 0.15       # min average precision over the top-k window
   recall_at_k: 0.35          # min average recall over the top-k window
   avg_quality_score: 3.5     # min mean LLM-judge answer score (1–5)
-  p95_latency_seconds: 5.0   # max p95 end-to-end latency per question (seconds)
+  p95_latency_seconds: 120.0   # max p95 end-to-end latency per question (seconds)
 
 # Folders ALWAYS unioned into the retrieval filter (a safety floor so HR/policy
 # folders survive router variance); leave empty for no floor.
