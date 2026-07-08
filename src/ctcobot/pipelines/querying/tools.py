@@ -4,10 +4,12 @@ RAG tool implementations for the querying pipeline.
 Exposes callable tools that each return list[dict] with keys:
   {text, source_path, folder, filename, chunk_index, score}
 
-Two tools:
+Three tools:
   - VectorRAGTool   — HyDE + folder-priority turbovec retrieval + LLM rerank
   - KeywordRAGTool  — folder-scoped BM25 lexical retrieval
+  - GraphRAGTool    — LightRAG knowledge-graph retrieval (entities/relations)
 """
+import asyncio
 import logging
 import re
 
@@ -243,3 +245,268 @@ class VectorRAGTool:
         return rerank_chunks(
             raw, query, self.reranker_model, self.rerank_top_n, self.ollama_base_url
         )
+
+
+# ── LightRAG graph search ─────────────────────────────────────────────────────
+
+# chunk_index namespace offset for graph-retrieved chunks. LightRAG re-chunks
+# documents internally (~1200 tokens), so its chunk numbering is unrelated to
+# the turbovec meta.json chunking; the offset keeps the agent's
+# (source_path, chunk_index) dedup from ever colliding a graph chunk with a
+# different-text vector/BM25 chunk of the same document.
+_GRAPH_CHUNK_INDEX_BASE = 100_000
+
+# Synthetic source for content that has no single origin document (the
+# knowledge-graph facts summary, or chunks LightRAG returns without a path).
+_GRAPH_KG_SOURCE = "lightrag://knowledge-graph"
+
+# Module-level cache: working_dir -> (LightRAG instance, dedicated event loop).
+# Initializing storages reloads every vector DB from disk; the eval loop must
+# do that once, not per question. All coroutines for an instance run on its
+# own loop so lightrag's loop handling stays consistent across calls.
+_LIGHTRAG_CACHE: dict[str, tuple] = {}
+
+
+def _graph_store_ready(working_dir: str) -> bool:
+    """True if a *built* LightRAG graph store exists under ``working_dir``.
+
+    A fresh or failed build leaves only ``kv_store_*.json`` stubs; a usable
+    store has the entity/relationship artifacts written by a completed
+    ``ctcobot index_graph`` run.
+    """
+    from pathlib import Path
+
+    root = Path(working_dir)
+    return any((root / name).exists() for name in (
+        "vdb_entities.json",
+        "vdb_relationships.json",
+        "graph_chunk_entity_relation.graphml",
+    ))
+
+
+def _graph_data_to_chunks(
+    result: dict,
+    max_chunks: int,
+    kg_summary_max_chars: int = 1200,
+) -> list[dict]:
+    """Map a LightRAG ``query_data`` payload onto the standard chunk schema.
+
+    Two kinds of chunks come out:
+      1. A single synthetic "knowledge-graph facts" chunk assembled from the
+         retrieved entity and relationship descriptions (the graph's unique
+         value: cross-document connections), capped at ``kg_summary_max_chars``.
+      2. Up to ``max_chunks`` document chunks, each carrying the real
+         ``file_path`` recorded at index time so answers can cite the source.
+
+    Returns [] on a failure payload — the tool contributes nothing rather
+    than sinking the question.
+    """
+    if not isinstance(result, dict) or result.get("status") != "success":
+        return []
+    data = result.get("data") or {}
+
+    chunks_out: list[dict] = []
+
+    # 1. Knowledge-graph facts summary (entities + relationships).
+    lines: list[str] = []
+    for e in data.get("entities") or []:
+        name = (e.get("entity_name") or "").strip()
+        desc = (e.get("description") or "").strip()
+        if name and desc:
+            lines.append(f"{name} ({e.get('entity_type', '?')}): {desc}")
+    for r in data.get("relationships") or []:
+        src, tgt = (r.get("src_id") or "").strip(), (r.get("tgt_id") or "").strip()
+        desc = (r.get("description") or "").strip()
+        if src and tgt and desc:
+            lines.append(f"{src} -> {tgt}: {desc}")
+
+    summary = ""
+    for line in lines:
+        if len(summary) + len(line) + 1 > kg_summary_max_chars:
+            break
+        summary += line + "\n"
+    if summary.strip():
+        chunks_out.append({
+            "text": "Knowledge-graph facts extracted from the handbook:\n"
+                    + summary.strip(),
+            "source_path": _GRAPH_KG_SOURCE,
+            "folder": "__graph__",
+            "filename": "knowledge-graph",
+            "chunk_index": _GRAPH_CHUNK_INDEX_BASE - 1,
+            "score": 0.0,
+        })
+
+    # 2. Document chunks with real source paths.
+    for i, ch in enumerate((data.get("chunks") or [])[:max_chunks]):
+        text = (ch.get("content") or "").strip()
+        if not text:
+            continue
+        fp = (ch.get("file_path") or "").strip()
+        real = bool(fp) and fp.lower() not in {"unknown_source", "unknown"}
+        chunks_out.append({
+            "text": text,
+            "source_path": fp if real else _GRAPH_KG_SOURCE,
+            "folder": fp.split("/")[0] if real and "/" in fp else "__graph__",
+            "filename": fp.rsplit("/", 1)[-1] if real else "knowledge-graph",
+            "chunk_index": _GRAPH_CHUNK_INDEX_BASE + i,
+            # Rank-derived placeholder: lightrag returns chunks already
+            # ordered; raw graph scores are not comparable across tools anyway
+            # and the merged rerank owns the final ordering.
+            "score": round(1.0 / (i + 1), 4),
+        })
+
+    return chunks_out
+
+
+class GraphRAGTool:
+    """LightRAG knowledge-graph retrieval.
+
+    Complements the vector and keyword tools on RELATIONSHIP questions —
+    multi-hop questions spanning several policies, teams, or entities ("how
+    does X affect Y", "who is responsible for X across Y") — where single-
+    chunk retrieval misses the connection between documents.
+
+    Retrieval-only integration: ``aquery_data`` returns the retrieved
+    entities, relationships, and document chunks WITHOUT LightRAG's own
+    answer generation, so the merged rerank + shared answer model stay in
+    charge (one extra LLM call for lightrag's query-keyword extraction, none
+    for generation).
+
+    ``ranked_folders`` is accepted for interface parity but ignored — the
+    graph is already scoped to the HR folders at index time
+    (``lightrag.index_folders``).
+    """
+
+    def __init__(
+        self,
+        ollama_base_url: str,
+        working_dir: str,
+        llm_model: str,
+        embedding_model: str,
+        embedding_dim: int = 768,
+        query_mode: str = "hybrid",
+        top_k: int = 20,
+        chunk_top_k: int = 5,
+        num_ctx: int = 8192,
+    ):
+        self.ollama_base_url = ollama_base_url
+        self.working_dir = working_dir
+        self.llm_model = llm_model
+        self.embedding_model = embedding_model
+        self.embedding_dim = embedding_dim
+        self.query_mode = query_mode
+        self.top_k = top_k
+        self.chunk_top_k = chunk_top_k
+        self.num_ctx = num_ctx
+        self.last_pre_rerank_sources: list[str] = []
+        self.last_pre_rerank_chunks: list[dict] = []
+
+    def _get_rag(self):
+        """Build (or fetch from cache) the LightRAG instance + its event loop."""
+        cached = _LIGHTRAG_CACHE.get(self.working_dir)
+        if cached is not None:
+            return cached
+
+        import numpy as np
+        import ollama as _ollama
+        from lightrag import LightRAG
+        from lightrag.kg.shared_storage import initialize_pipeline_status
+        from lightrag.llm.ollama import ollama_model_complete
+        from lightrag.utils import EmbeddingFunc
+
+        logger.info("Loading LightRAG graph store from %s ...", self.working_dir)
+        client = _ollama.AsyncClient(host=self.ollama_base_url)
+
+        async def _embed(texts: list[str]) -> np.ndarray:
+            r = await client.embed(model=self.embedding_model, input=texts)
+            return np.array(r.embeddings)
+
+        rag = LightRAG(
+            working_dir=self.working_dir,
+            llm_model_func=ollama_model_complete,
+            llm_model_name=self.llm_model,
+            llm_model_kwargs={
+                "host": self.ollama_base_url,
+                "options": {"num_ctx": self.num_ctx},
+            },
+            embedding_func=EmbeddingFunc(
+                embedding_dim=self.embedding_dim,
+                max_token_size=8192,
+                func=_embed,
+            ),
+        )
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(rag.initialize_storages())
+        loop.run_until_complete(initialize_pipeline_status())
+        logger.info("LightRAG graph store loaded.")
+
+        _LIGHTRAG_CACHE[self.working_dir] = (rag, loop)
+        return rag, loop
+
+    def __call__(self, query: str, ranked_folders: list[str] | None = None) -> list[dict]:
+        from lightrag import QueryParam
+
+        try:
+            rag, loop = self._get_rag()
+            param = QueryParam(
+                mode=self.query_mode,
+                top_k=self.top_k,
+                chunk_top_k=self.chunk_top_k,
+                # lightrag's own rerank binding is not configured; the agent's
+                # merged rerank owns ordering.
+                enable_rerank=False,
+            )
+            result = loop.run_until_complete(rag.aquery_data(query, param))
+        except Exception as e:
+            logger.warning("Graph retrieval failed (%s); contributing no chunks", e)
+            self.last_pre_rerank_sources = []
+            self.last_pre_rerank_chunks = []
+            return []
+
+        chunks = _graph_data_to_chunks(result, self.chunk_top_k)
+
+        # Only doc-grounded chunks participate in retrieval metrics; the
+        # synthetic knowledge-graph summary has no source document to credit.
+        real = [c for c in chunks if c["source_path"] != _GRAPH_KG_SOURCE]
+        self.last_pre_rerank_sources = [c["source_path"] for c in real]
+        self.last_pre_rerank_chunks = [
+            {"source_path": c["source_path"], "chunk_index": c["chunk_index"]}
+            for c in real
+        ]
+        logger.info(
+            "Graph retrieved %d chunks (%d doc-grounded). Mode: %s",
+            len(chunks), len(real), self.query_mode,
+        )
+        return chunks
+
+
+def maybe_graph_tool(lightrag_cfg: dict | None, ollama_base_url: str) -> GraphRAGTool | None:
+    """Build a GraphRAGTool from the ``lightrag`` params block, or None.
+
+    Returns None (with a log line saying why) when the block is missing,
+    ``enabled`` is false, or the graph store has not been built yet — callers
+    register the graph_rag tool only when it can actually serve queries.
+    """
+    cfg = lightrag_cfg or {}
+    if not cfg.get("enabled", False):
+        logger.info("LightRAG graph tool disabled in parameters.")
+        return None
+    working_dir = cfg.get("working_dir", "data/04_feature/lightrag_db")
+    if not _graph_store_ready(working_dir):
+        logger.warning(
+            "LightRAG is enabled but no built graph store found at %s — "
+            "run `ctcobot index_graph` first. Continuing without graph_rag.",
+            working_dir,
+        )
+        return None
+    return GraphRAGTool(
+        ollama_base_url=ollama_base_url,
+        working_dir=working_dir,
+        llm_model=cfg.get("llm_model", "qwen3.5:4b"),
+        embedding_model=cfg.get("embedding_model", "nomic-embed-text"),
+        embedding_dim=int(cfg.get("embedding_dim", 768)),
+        query_mode=cfg.get("query_mode", "hybrid"),
+        top_k=int(cfg.get("top_k", 20)),
+        chunk_top_k=int(cfg.get("chunk_top_k", 5)),
+        num_ctx=int(cfg.get("num_ctx", 8192)),
+    )

@@ -45,10 +45,14 @@ def _load_kedro_params():
     help="Number of chunks for VectorRAG retrieval before reranking.",
 )
 def ask(question: str, top_k: int):
-    """Ask ctcobot an HR policy question (agentic vector + BM25 RAG)."""
+    """Ask ctcobot an HR policy question (agentic vector + BM25 + graph RAG)."""
     params = _load_kedro_params()
 
-    from ctcobot.pipelines.querying.tools import VectorRAGTool, KeywordRAGTool
+    from ctcobot.pipelines.querying.tools import (
+        VectorRAGTool,
+        KeywordRAGTool,
+        maybe_graph_tool,
+    )
     from ctcobot.pipelines.querying.agent import QueryAgent
 
     vector_tool = VectorRAGTool(
@@ -71,8 +75,13 @@ def ask(question: str, top_k: int):
         top_folders=params["top_folders"],
         priority_folders=params["priority_folders"],
     )
+    tools = {"vector_rag": vector_tool, "keyword_rag": keyword_tool}
+    graph_tool = maybe_graph_tool(params.get("lightrag"), params["ollama_base_url"])
+    if graph_tool is not None:
+        tools["graph_rag"] = graph_tool
+
     agent = QueryAgent(
-        tools={"vector_rag": vector_tool, "keyword_rag": keyword_tool},
+        tools=tools,
         ollama_base_url=params["ollama_base_url"],
         agent_model=params["agent_model"],
         llm_model=params["llm_model"],

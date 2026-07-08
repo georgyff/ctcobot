@@ -65,11 +65,27 @@ priority_folders:
   - "total-rewards"
   - "people-policies"
 
-# ── LightRAG (optional knowledge-graph index, currently not working) ─────────────────────────────────
-lightrag_working_dir: "data/04_feature/lightrag_db"   # directory for the LightRAG graph store
-lightrag_index_folders:                               # only these top-level folders are graph-indexed
-  - people-policies
-  - people-group
-  - hiring
-  - legal
-  - company
+# ── LightRAG (knowledge-graph index + graph_rag agent tool) ───────────────────
+# Build the graph store with `ctcobot index_graph` (slow: LLM entity/relation
+# extraction over every indexed doc — budget machine time accordingly). The
+# agent registers the graph_rag tool only when `enabled` is true AND a built
+# store exists under working_dir; otherwise it degrades gracefully to the
+# vector + keyword tools.
+lightrag:
+  enabled: true
+  working_dir: "data/04_feature/lightrag_db"   # graph store location
+  index_folders:              # only these top-level folders are graph-indexed
+    - people-policies
+    - people-group
+    - hiring
+    - legal
+    - company
+  llm_model: "qwen3.5:4b"               # entity/relation extraction + query keyword extraction
+  embedding_model: "nomic-embed-text"   # must stay consistent between index and query
+  embedding_dim: 768                    # output size of embedding_model
+  num_ctx: 8192                         # context window for extraction/query LLM calls
+  query_mode: "hybrid"                  # local | global | hybrid | mix | naive
+  top_k: 20                             # entities/relations retrieved per query
+  chunk_top_k: 5                        # document chunks the graph tool returns
+  max_parallel_insert: 2                # concurrent docs during the graph build
+  insert_batch_size: 20                 # docs per insert batch during the build

@@ -186,18 +186,22 @@ identical set of chunks.
 ### 5.2 Querying — the agentic RAG path (`ctcobot ask`)
 
 `ctcobot ask` does **not** run a Kedro pipeline. It instantiates a
-`VectorRAGTool`, a `KeywordRAGTool`, and a `QueryAgent`
+`VectorRAGTool`, a `KeywordRAGTool`, a `GraphRAGTool` (only when the LightRAG
+store is built and `lightrag.enabled` is true), and a `QueryAgent`
 (`src/ctcobot/pipelines/querying/{tools,agent}.py`) and answers one question:
 
 1. **Folder ranking** — one LLM call (`rank_folders`) ranks the corpus's
    top-level folders by relevance to the question. The result is computed once
-   and shared by both tools (no duplicate call). Downstream it is always unioned
-   with the `priority_folders` floor so canonical HR folders survive router
-   variance.
-2. **Routing** — the tool-calling `agent_model` decides whether to also use
-   keyword search. `vector_rag` **always** runs as a semantic floor; the router
-   (plus an acronym / quoted-phrase / hyphenated-term safety net) only decides
-   whether to **also** run `keyword_rag`. This prevents keyword-only misses.
+   and shared by the folder-scoped tools (no duplicate call). Downstream it is
+   always unioned with the `priority_folders` floor so canonical HR folders
+   survive router variance.
+2. **Routing** — the tool-calling `agent_model` picks which tool(s) to run;
+   its choice is authoritative and no tool is forced onto every question.
+   Two guards remain: an acronym / quoted-phrase / hyphenated-term safety net
+   force-adds `keyword_rag` on literal-term questions, and if the router
+   returns nothing usable the agent falls back to `vector_rag` — so at least
+   one tool always runs. `graph_rag` (if registered) joins on the router's
+   call for relationship / multi-hop questions.
 3. **`vector_rag` (HyDE)** — the LLM writes a hypothetical answer paragraph
    (HyDE), that paragraph is embedded, and `retrieve_chunks_folder_priority`
    oversamples `top_k × retrieve_oversample` candidates from the index, filters
@@ -208,12 +212,19 @@ identical set of chunks.
    index built from `meta.json`), restricted to the same folder set, returning
    `bm25_top_k` candidates. Targets exact-term / acronym questions embeddings
    blur.
-5. **Merge + rerank** — the vector tool returns candidates already reranked by
-   `reranker_model`; the keyword tool returns its BM25 candidates unreranked.
-   The agent merges and deduplicates both by `(source_path, chunk_index)`, then
-   reranks the merged set **again** with `agent_reranker_model` (a listwise LLM
-   rerank) down to `rerank_top_n` chunks.
-6. **Answer** — `generate_answer` calls `llm_model` (temperature 0.2) on the
+5. **`graph_rag` (LightRAG)** — retrieval-only knowledge-graph search: returns a
+   synthetic "knowledge-graph facts" chunk (retrieved entity + relationship
+   descriptions) plus up to `lightrag.chunk_top_k` document chunks with their
+   real source paths. No answer generation happens inside LightRAG — the merged
+   rerank and the shared answer model stay in charge. Targets relationship /
+   multi-hop questions where the connection between documents matters.
+6. **Merge + rerank** — the vector tool returns candidates already reranked by
+   `reranker_model`; the keyword and graph tools return theirs unreranked. The
+   agent merges and deduplicates all of them by `(source_path, chunk_index)`
+   (graph chunks live in a separate index namespace so they never collide),
+   then reranks the merged set **again** with `agent_reranker_model` (a
+   listwise LLM rerank) down to `rerank_top_n` chunks.
+7. **Answer** — `generate_answer` calls `llm_model` (temperature 0.2) on the
    reranked chunks under the grounding `SYSTEM_PROMPT`, returning the answer plus
    deduplicated source citations.
 
@@ -251,14 +262,17 @@ Benchmarks the agentic path against the `eval_qa_pairs` CSV. Five nodes
 
 ### 5.4 Graph indexing pipeline (`ctcobot index_graph` → `lightrag_indexing`)
 
-**Optional / experimental** — not wired into the answer path. A single node
+**Optional** — feeds the `graph_rag` agent tool (5.2). A single node
 `build_lightrag_index` builds a [LightRAG](https://github.com/HKUDS/LightRAG)
 knowledge graph from the `cleaned_docs` produced by the indexing pipeline,
-filtered to `lightrag_index_folders`, using `llm_model` for entity/relationship
-extraction and `embedding_model` for the graph's vector components. The store is
-written to `lightrag_working_dir`. Because it consumes `cleaned_docs`, run
-`ctcobot index` first. It is slow (many LLM calls) and currently informational
-only.
+filtered to `lightrag.index_folders`, using `lightrag.llm_model` for
+entity/relationship extraction and `lightrag.embedding_model` for the graph's
+vector components. Every document is inserted with its corpus-relative path so
+graph results can cite real sources. The store is written to
+`lightrag.working_dir`. Because it consumes `cleaned_docs`, run `ctcobot index`
+first. It is slow (many LLM calls — budget machine time, e.g. run overnight);
+once the store exists, `ctcobot ask` and `ctcobot evaluate` pick up the
+`graph_rag` tool automatically while `lightrag.enabled` is true.
 
 ---
 
@@ -273,6 +287,10 @@ only.
 | `bm25_top_k` | 10 | Keyword (BM25) candidates before merge. |
 | `min_doc_tokens` | 50 | Drop documents shorter than this. |
 | `embedding_model` / `llm_model` / `reranker_model` / `agent_model` / `judge_model` | see file | Ollama model names. |
+| `lightrag.enabled` | true | Register the `graph_rag` tool (needs a built store). |
+| `lightrag.query_mode` | hybrid | LightRAG retrieval mode (local / global / hybrid / mix / naive). |
+| `lightrag.top_k` / `lightrag.chunk_top_k` | 20 / 5 | Graph entities+relations retrieved / doc chunks returned. |
+| `lightrag.index_folders` | HR folders | Top-level folders included in the graph build. |
 
 ---
 

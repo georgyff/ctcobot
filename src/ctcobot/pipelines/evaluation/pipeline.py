@@ -28,6 +28,7 @@ def create_pipeline(**kwargs) -> Pipeline:
                 "params:bm25_top_k",
                 "params:priority_folders",
                 "params:agent_reranker_model",
+                "params:lightrag",
             ],
             outputs="qa_eval_results",
             name="run_eval_pipeline_node",

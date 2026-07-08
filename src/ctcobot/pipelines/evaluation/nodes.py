@@ -12,7 +12,11 @@ import ollama
 import pandas as pd
 
 from ctcobot.pipelines.querying.agent import QueryAgent
-from ctcobot.pipelines.querying.tools import KeywordRAGTool, VectorRAGTool
+from ctcobot.pipelines.querying.tools import (
+    KeywordRAGTool,
+    VectorRAGTool,
+    maybe_graph_tool,
+)
 from ctcobot.prompt_templates import JUDGE_PROMPT, format_judge_prompt
 
 logger = logging.getLogger(__name__)
@@ -33,16 +37,21 @@ def run_eval_pipeline(
     bm25_top_k: int,
     priority_folders: list[str],
     agent_reranker_model: str,
+    lightrag: dict | None = None,
 ) -> list[dict]:
     """
     Run the agentic RAG pipeline once per QA pair.
 
-    A QueryAgent always runs the vector HyDE tool and, when the router or the
-    acronym heuristic calls for it, also the folder-scoped BM25 keyword tool;
-    it merges + reranks the results and generates the answer. Both tools share
-    a guaranteed HR-folder floor (``priority_folders``). Captures the union of
-    pre-rerank sources (for retrieval metrics), which tool(s) were used, and
-    the answer (for quality).
+    A QueryAgent routes each question to the tool(s) its router picks —
+    vector HyDE search, folder-scoped BM25 keyword search, and (when the
+    LightRAG graph store is built and enabled) knowledge-graph search for
+    relationship questions. No tool is forced onto every question; the
+    acronym heuristic can add the keyword tool, and an empty routing falls
+    back to the vector tool so at least one tool always runs. The agent
+    merges + reranks the results and generates the answer. The folder-scoped
+    tools share a guaranteed HR-folder floor (``priority_folders``). Captures
+    the union of pre-rerank sources (for retrieval metrics), which tool(s)
+    were used, and the answer (for quality).
     """
     vector_tool = VectorRAGTool(
         ollama_base_url=ollama_base_url,
@@ -64,8 +73,13 @@ def run_eval_pipeline(
         top_folders=top_folders,
         priority_folders=priority_folders,
     )
+    tools = {"vector_rag": vector_tool, "keyword_rag": keyword_tool}
+    graph_tool = maybe_graph_tool(lightrag, ollama_base_url)
+    if graph_tool is not None:
+        tools["graph_rag"] = graph_tool
+
     agent = QueryAgent(
-        tools={"vector_rag": vector_tool, "keyword_rag": keyword_tool},
+        tools=tools,
         ollama_base_url=ollama_base_url,
         agent_model=agent_model,
         llm_model=llm_model,

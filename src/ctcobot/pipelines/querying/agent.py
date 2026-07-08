@@ -5,9 +5,16 @@ A QueryAgent uses an Ollama tool-calling LLM to decide which retrieval tool(s)
 to invoke for a given question, executes them, merges and reranks the results,
 then synthesizes an answer.
 
-Two tools are wired in:
-  - vector_rag  (VectorRAGTool)  — semantic HyDE retrieval
+Up to three tools are wired in:
+  - vector_rag  (VectorRAGTool)  — semantic HyDE retrieval (default fallback)
   - keyword_rag (KeywordRAGTool) — folder-scoped BM25 lexical retrieval
+  - graph_rag   (GraphRAGTool)   — LightRAG knowledge-graph retrieval,
+                                   registered only when the graph store is
+                                   built and enabled (see maybe_graph_tool)
+
+The router's tool choice is authoritative — no tool is forced onto every
+question. At least one tool always runs: an empty or failed routing falls
+back to vector_rag (or the first registered tool).
 """
 import logging
 import re
@@ -41,13 +48,45 @@ def _question_needs_keyword(question: str) -> bool:
     return False
 
 
+def _select_tools(routed: list[str], available: dict, question: str) -> list[str]:
+    """Final tool selection from the router's picks.
+
+    The router's choice is authoritative — no always-on tool. Two guards
+    remain: the acronym/exact-term safety net force-includes keyword_rag
+    (the documented exact-term failure class), and an empty or failed routing
+    falls back to vector_rag (or the first registered tool) so at least one
+    tool always runs.
+    """
+    chosen = [name for name in routed if name in available]
+
+    if not chosen:
+        # No usable routing (failed call or unknown names). Fall back to the
+        # safe default BEFORE the keyword net, so a routing failure on a
+        # literal-term question never degrades to keyword-only retrieval —
+        # a deliberate keyword-only pick by the router is still respected.
+        chosen = ["vector_rag"] if "vector_rag" in available else list(available)[:1]
+
+    if (
+        _question_needs_keyword(question)
+        and "keyword_rag" in available
+        and "keyword_rag" not in chosen
+    ):
+        chosen.append("keyword_rag")
+
+    return chosen
+
+
 class QueryAgent:
-    """Routes a question to vector_rag and/or keyword_rag, then answers.
+    """Routes a question to vector_rag / keyword_rag / graph_rag, then answers.
 
     Flow:
-      1. rank_folders once, shared by both tools (avoids duplicate LLM calls).
-      2. LLM tool-calling round(s) choose the tool(s).
-      3. Acronym safety net force-includes keyword_rag when warranted.
+      1. rank_folders once, shared by the folder-scoped tools (avoids
+         duplicate LLM calls).
+      2. LLM tool-calling round(s) choose the tool(s) — the router's pick is
+         authoritative; no tool is forced onto every question.
+      3. Guards: the acronym safety net force-includes keyword_rag on
+         literal-term questions; an empty/failed routing falls back to
+         vector_rag so at least one tool always runs.
       4. Execute chosen tools, passing the shared folder ranking.
       5. Merge + dedupe chunks, LLM listwise rerank, generate the answer.
     """
@@ -104,7 +143,7 @@ class QueryAgent:
                     name = tc["function"]["name"]
                     if name in self.tools and name not in chosen:
                         chosen.append(name)
-                # One routing round is enough for our two-tool setup.
+                # One routing round is enough for our small tool set.
                 break
         except Exception as e:
             logger.warning("Agent routing failed (%s); defaulting to vector_rag", e)
@@ -128,22 +167,13 @@ class QueryAgent:
         # 2. LLM routing decides which optional tools to add to the vector floor.
         routed = self._route(question)
 
-        # 3. vector_rag is ALWAYS run as the semantic floor; the router and the
-        #    acronym safety net only decide whether to ALSO run keyword_rag.
-        #    This prevents the keyword-only catastrophic misses seen in v5.0
-        #    (9-box, TNTR), turning BM25 into a pure recall booster.
-        chosen: list[str] = []
-        if "vector_rag" in self.tools:
-            chosen.append("vector_rag")
-
-        want_keyword = "keyword_rag" in routed or _question_needs_keyword(question)
-        if want_keyword and "keyword_rag" in self.tools and "keyword_rag" not in chosen:
-            chosen.append("keyword_rag")
-
-        # 4. Fallback: if vector_rag isn't registered, use whatever routed (or
-        #    the first available tool) so we never run with no tool.
-        if not chosen:
-            chosen = routed or list(self.tools)[:1]
+        # 3. The router's choice is final — no always-on vector floor. The
+        #    acronym safety net still force-includes keyword_rag on literal-
+        #    term questions, and an empty/failed routing falls back to
+        #    vector_rag so at least one tool always runs.
+        chosen = _select_tools(routed, self.tools, question)
+        if not routed:
+            logger.info("Router chose no tools; falling back to %s", chosen)
         logger.info("Agent routing chose: %s | %s", chosen, question[:60])
 
         # 5. Execute tools, sharing the folder ranking. Collect the deduped

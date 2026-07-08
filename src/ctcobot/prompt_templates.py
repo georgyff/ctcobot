@@ -166,12 +166,22 @@ AGENT_SYSTEM_PROMPT = (
     "- keyword_rag: exact lexical / keyword search. Best when the question hinges "
     "on a specific literal term the handbook would contain verbatim: acronyms, "
     "short codes, program or model names, exact form names, email addresses, or "
-    "proper nouns.\n\n"
+    "proper nouns.\n"
+    "- graph_rag: knowledge-graph search over entities and relationships "
+    "extracted from the handbook. Best when the question is about how things "
+    "RELATE or spans multiple policies, teams, or roles: 'how does X affect Y', "
+    "'what is the relationship between A and B', 'who is responsible for X "
+    "across Y', comparisons of two policies, or processes that chain several "
+    "policies together.\n\n"
     "Routing rules:\n"
     "- For a purely conceptual question, call vector_rag.\n"
     "- For a question that turns on a specific acronym, code, or exact term, "
-    "call keyword_rag.\n"
-    "- When a question mixes a concept with a specific term, call BOTH tools.\n"
+    "call keyword_rag — usually TOGETHER with vector_rag, because keyword "
+    "search alone misses the surrounding policy context.\n"
+    "- For a multi-hop or relationship question connecting two or more "
+    "policies, teams, or entities, call graph_rag.\n"
+    "- When a question fits several patterns, call the matching tools together.\n"
+    "- If unsure, call vector_rag — it is the safe default.\n"
     "- Always call at least one tool. Pass the user's question as the 'query'.\n"
 )
 
@@ -206,6 +216,28 @@ AGENT_TOOLS = [
                 "Exact keyword (BM25) search over the handbook, folder-scoped. "
                 "Use for acronyms, codes, model names, exact terms, or proper "
                 "nouns the handbook contains verbatim."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The employee's question, verbatim.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_rag",
+            "description": (
+                "Knowledge-graph search over entities and relationships "
+                "extracted from the handbook. Use for multi-hop or "
+                "relationship questions that connect two or more policies, "
+                "teams, roles, or entities."
             ),
             "parameters": {
                 "type": "object",
